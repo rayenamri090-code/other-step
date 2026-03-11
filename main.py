@@ -13,6 +13,10 @@ from database import (
     add_access_event,
     add_alert,
     update_last_seen,
+    get_all_appearance_counts,
+    get_all_total_visible_times,
+    get_all_daily_first_last_entries,
+    get_all_daily_work_hours,
 )
 from camera_source import CameraSource
 from detector import FaceDetector
@@ -69,6 +73,56 @@ def draw_track(frame, track, decision=None):
         )
 
 
+def print_daily_report(date_str: str):
+    print("\n" + "=" * 70)
+    print(f"[REPORT] Daily analytics for {date_str}")
+    print("=" * 70)
+
+    appearances = get_all_appearance_counts(date_str)
+    visible_times = get_all_total_visible_times(date_str)
+    first_last = get_all_daily_first_last_entries(date_str)
+    work_hours = get_all_daily_work_hours(date_str)
+
+    print("\n[1] Appearance counts")
+    if appearances:
+        for item in appearances:
+            print(f"  - {item['person_id']}: {item['appearances']} appearance(s)")
+    else:
+        print("  No appearance data.")
+
+    print("\n[2] Total visible time")
+    if visible_times:
+        for item in visible_times:
+            total_sec = item["total_visible_seconds"]
+            total_min = total_sec / 60.0
+            print(f"  - {item['person_id']}: {total_sec:.1f} sec ({total_min:.2f} min)")
+    else:
+        print("  No visible time data.")
+
+    print("\n[3] First entry / Last entry")
+    if first_last:
+        for item in first_last:
+            print(
+                f"  - {item['person_id']}: "
+                f"first_entry={item['first_entry']} | last_entry={item['last_entry']}"
+            )
+    else:
+        print("  No access session data.")
+
+    print("\n[4] Work hours in front of camera")
+    if work_hours:
+        for item in work_hours:
+            print(
+                f"  - {item['person_id']}: "
+                f"{item['total_visible_seconds']:.1f} sec | "
+                f"{item['total_visible_hours']:.4f} hour(s)"
+            )
+    else:
+        print("  No work-hour data.")
+
+    print("=" * 70 + "\n")
+
+
 def main():
     init_db()
     create_demo_seed()
@@ -91,11 +145,14 @@ def main():
     print("[INFO] Enterprise prototype started")
     print(f"[INFO] Camera ID: {CAMERA_ID}")
     print(f"[INFO] Zone: {zone_name}")
+    print("[INFO] Press Q to quit")
+    print("[INFO] Press R to print today's analytics report")
 
     try:
         while True:
             ok, frame = camera.read()
             if not ok:
+                print("[WARN] Failed to read frame from camera")
                 break
 
             detections = detector.detect_all(frame)
@@ -128,7 +185,7 @@ def main():
 
                 identity_service.process_track_identity(track, embedding)
 
-                if track["identity_type"] == "unknown_candidate":
+                if track.get("identity_type") == "unknown_candidate":
                     created = identity_service.convert_unknown_candidate_if_stable(track, embedding)
                     if created:
                         add_access_event(
@@ -200,8 +257,14 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), ord("Q")):
                 break
+            elif key in (ord("r"), ord("R")):
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                print_daily_report(today_str)
 
     finally:
+        for track in list(tracker.tracks.values()):
+            session_service.on_track_removed(track)
+
         camera.release()
         cv2.destroyAllWindows()
         mqtt_service.disconnect()
