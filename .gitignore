@@ -1,0 +1,21 @@
+# virtual env
+.venv/
+venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# databases
+*.db
+*.sqlite
+*.sqlite3
+
+# models / generated files
+*.npy
+*.yml
+*.onnx
+
+# OS trash
+.DS_Store
+Thumbs.db
