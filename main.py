@@ -1,9 +1,11 @@
 import time
-import json
 import cv2
 from datetime import datetime
 
-from config import WINDOW_NAME, CAMERA_ID, LOG_COOLDOWN_SEC
+from config import validate_config, WINDOW_NAME, CAMERA_ID, LOG_COOLDOWN_SEC
+
+validate_config()
+
 from database import (
     init_db,
     create_demo_seed,
@@ -45,12 +47,26 @@ def draw_track(frame, track, decision=None):
     if score is not None:
         top += f" {score:.3f}"
 
-    cv2.putText(frame, top, (x, y - 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+    cv2.putText(
+        frame,
+        top,
+        (x, y - 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        color,
+        2,
+    )
 
     if decision:
-        cv2.putText(frame, decision, (x, y - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        cv2.putText(
+            frame,
+            decision,
+            (x, y - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+        )
 
 
 def main():
@@ -96,7 +112,7 @@ def main():
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 (255, 255, 255),
-                2
+                2,
             )
 
             for track_id, track in live_tracks.items():
@@ -121,7 +137,7 @@ def main():
                             person_id=created,
                             action="UNKNOWN_AUTO_CREATED",
                             confidence=None,
-                            extra="pending_validation"
+                            extra="pending_validation",
                         )
                         mqtt_service.publish({
                             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -129,13 +145,13 @@ def main():
                             "track_id": track_id,
                             "person_id": created,
                             "action": "UNKNOWN_AUTO_CREATED",
-                            "extra": "pending_validation"
+                            "extra": "pending_validation",
                         })
 
                 decision, reason = authorization_service.decide(
                     track.get("identity"),
                     track.get("identity_type"),
-                    zone_name
+                    zone_name,
                 )
 
                 person_id = track.get("identity")
@@ -144,7 +160,7 @@ def main():
                     session_service.on_track_seen(track, person_id)
 
                 if person_id:
-                    since_last_log = now_ts - track["last_logged_ts"]
+                    since_last_log = now_ts - track.get("last_logged_ts", 0)
                     if since_last_log >= LOG_COOLDOWN_SEC:
                         add_access_event(
                             camera_id=CAMERA_ID,
@@ -152,7 +168,7 @@ def main():
                             person_id=person_id,
                             action=decision,
                             confidence=track.get("identity_score"),
-                            extra=reason
+                            extra=reason,
                         )
                         mqtt_service.publish({
                             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -162,18 +178,18 @@ def main():
                             "identity_type": track.get("identity_type"),
                             "action": decision,
                             "confidence": track.get("identity_score"),
-                            "extra": reason
+                            "extra": reason,
                         })
                         track["last_logged_ts"] = now_ts
 
-                if decision == "ALERT_PENDING" and not track["pending_alert_sent"]:
+                if decision == "ALERT_PENDING" and not track.get("pending_alert_sent", False):
                     add_alert(
                         camera_id=CAMERA_ID,
                         track_id=track_id,
                         person_id=person_id,
                         alert_type="UNKNOWN_PENDING_VALIDATION",
                         notes=reason,
-                        status="open"
+                        status="open",
                     )
                     track["pending_alert_sent"] = True
 

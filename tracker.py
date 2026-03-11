@@ -1,5 +1,5 @@
 from math import hypot
-from config import TRACK_MAX_MISSING_FRAMES, TRACK_MATCH_DISTANCE
+from config import TRACK_MATCH_DISTANCE_PX, TRACK_MAX_MISSING_FRAMES
 
 
 class MultiFaceTracker:
@@ -28,12 +28,13 @@ class MultiFaceTracker:
             for i, det in enumerate(detections):
                 if i in assigned:
                     continue
+
                 dist = self._distance(track["bbox"], det["bbox"])
                 if dist < best_dist:
                     best_dist = dist
                     best_idx = i
 
-            if best_idx is not None and best_dist <= TRACK_MATCH_DISTANCE:
+            if best_idx is not None and best_dist <= TRACK_MATCH_DISTANCE_PX:
                 det = detections[best_idx]
                 assigned.add(best_idx)
 

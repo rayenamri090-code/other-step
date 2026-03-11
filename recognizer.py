@@ -1,8 +1,8 @@
-import os
 import json
 import cv2
 import numpy as np
-from config import SFACE_MODEL, COSINE_THRESHOLD
+
+from config import SFACE_MODEL, RECOGNITION_MATCH_THRESHOLD
 from database import get_all_identities_with_embeddings
 
 
@@ -20,12 +20,12 @@ def cosine_similarity(a, b):
 
 class FaceRecognizer:
     def __init__(self):
-        if not os.path.exists(SFACE_MODEL):
+        if not SFACE_MODEL.exists():
             raise FileNotFoundError(f"Missing SFace model: {SFACE_MODEL}")
 
-        self.recognizer = cv2.FaceRecognizerSF.create(SFACE_MODEL, "")
+        self.recognizer = cv2.FaceRecognizerSF.create(str(SFACE_MODEL), "")
         self.embeddings = {"employee": {}, "visitor": {}, "unknown": {}}
-        self.threshold = COSINE_THRESHOLD
+        self.threshold = RECOGNITION_MATCH_THRESHOLD
         self.reload_embeddings()
 
     def reload_embeddings(self):
@@ -35,6 +35,7 @@ class FaceRecognizer:
         for person_id, person_type, status, emb_json in rows:
             if status == "blocked":
                 continue
+
             emb = normalize_embedding(json.loads(emb_json))
             self.embeddings.setdefault(person_type, {}).setdefault(person_id, []).append(emb)
 
@@ -50,6 +51,7 @@ class FaceRecognizer:
         for person_id, emb_list in self.embeddings.get(person_type, {}).items():
             if not emb_list:
                 continue
+
             score = max(cosine_similarity(query_emb, emb) for emb in emb_list)
             if score > best_score:
                 best_score = score
@@ -64,11 +66,11 @@ class FaceRecognizer:
                 return {
                     "person_id": person_id,
                     "person_type": person_type,
-                    "score": score
+                    "score": score,
                 }
 
         return {
             "person_id": None,
             "person_type": None,
-            "score": None
+            "score": None,
         }

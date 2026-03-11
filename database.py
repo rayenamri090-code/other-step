@@ -1,6 +1,13 @@
 import sqlite3
 from datetime import datetime
-from config import DB_FILE, CAMERA_ID, DEFAULT_ZONE_NAME, DEFAULT_ZONE_TYPE, DEFAULT_IS_ACCESS_POINT
+
+from config import (
+    DB_FILE,
+    CAMERA_ID,
+    DEFAULT_ZONE_NAME,
+    DEFAULT_ZONE_TYPE,
+    DEFAULT_IS_ACCESS_POINT,
+)
 
 
 def now_str() -> str:
@@ -68,12 +75,12 @@ def init_db():
     c.execute("""
     CREATE TABLE IF NOT EXISTS access_policies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        subject_type TEXT NOT NULL,   -- person / role / visitor
+        subject_type TEXT NOT NULL,
         subject_value TEXT NOT NULL,
         zone_name TEXT NOT NULL,
-        allowed_days TEXT NOT NULL,   -- Mon,Tue,Wed,...
-        allowed_start TEXT NOT NULL,  -- HH:MM
-        allowed_end TEXT NOT NULL     -- HH:MM
+        allowed_days TEXT NOT NULL,
+        allowed_start TEXT NOT NULL,
+        allowed_end TEXT NOT NULL
     )
     """)
 
@@ -151,13 +158,13 @@ def get_camera_zone(camera_id: str):
         return {
             "zone_name": DEFAULT_ZONE_NAME,
             "zone_type": DEFAULT_ZONE_TYPE,
-            "is_access_point": DEFAULT_IS_ACCESS_POINT
+            "is_access_point": DEFAULT_IS_ACCESS_POINT,
         }
 
     return {
         "zone_name": row[0],
         "zone_type": row[1],
-        "is_access_point": int(row[2])
+        "is_access_point": int(row[2]),
     }
 
 
@@ -333,8 +340,10 @@ def create_demo_seed():
 
     c.execute("SELECT COUNT(*) FROM employees")
     count = c.fetchone()[0]
+
     if count == 0:
         ensure_identity("emp_001", "employee", "Employee 001", "active")
+
         c.execute("""
         INSERT OR IGNORE INTO employees (person_id, employee_code, department, role_name, schedule_id)
         VALUES ('emp_001', 'E001', 'IT', 'engineer', 'sched_office')
