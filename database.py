@@ -228,6 +228,50 @@ def get_all_identities_with_embeddings():
     return rows
 
 
+def get_identity_info(person_id: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    SELECT person_id, person_type, display_name, status
+    FROM identities
+    WHERE person_id = ?
+    """, (person_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "person_id": row[0],
+        "person_type": row[1],
+        "display_name": row[2],
+        "status": row[3],
+    }
+
+
+def get_all_identities():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    SELECT person_id, person_type, display_name, status
+    FROM identities
+    ORDER BY person_type ASC, person_id ASC
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    return [
+        {
+            "person_id": row[0],
+            "person_type": row[1],
+            "display_name": row[2],
+            "status": row[3],
+        }
+        for row in rows
+    ]
+
+
 def next_person_id(prefix: str, person_type: str) -> str:
     conn = get_conn()
     c = conn.cursor()
@@ -391,25 +435,31 @@ def get_all_appearance_counts(date_str: str | None = None):
 
     if date_str:
         c.execute("""
-        SELECT person_id, COUNT(*) AS appearances
-        FROM visible_sessions
-        WHERE date(start_time) = ?
-        GROUP BY person_id
-        ORDER BY appearances DESC, person_id ASC
+        SELECT i.person_id, i.person_type, COUNT(vs.id) AS appearances
+        FROM identities i
+        JOIN visible_sessions vs ON vs.person_id = i.person_id
+        WHERE date(vs.start_time) = ?
+        GROUP BY i.person_id, i.person_type
+        ORDER BY i.person_type ASC, appearances DESC, i.person_id ASC
         """, (date_str,))
     else:
         c.execute("""
-        SELECT person_id, COUNT(*) AS appearances
-        FROM visible_sessions
-        GROUP BY person_id
-        ORDER BY appearances DESC, person_id ASC
+        SELECT i.person_id, i.person_type, COUNT(vs.id) AS appearances
+        FROM identities i
+        JOIN visible_sessions vs ON vs.person_id = i.person_id
+        GROUP BY i.person_id, i.person_type
+        ORDER BY i.person_type ASC, appearances DESC, i.person_id ASC
         """)
 
     rows = c.fetchall()
     conn.close()
 
     return [
-        {"person_id": row[0], "appearances": int(row[1])}
+        {
+            "person_id": row[0],
+            "person_type": row[1],
+            "appearances": int(row[2]),
+        }
         for row in rows
     ]
 
@@ -443,25 +493,31 @@ def get_all_total_visible_times(date_str: str | None = None):
 
     if date_str:
         c.execute("""
-        SELECT person_id, COALESCE(SUM(duration_seconds), 0) AS total_seconds
-        FROM visible_sessions
-        WHERE date(start_time) = ?
-        GROUP BY person_id
-        ORDER BY total_seconds DESC, person_id ASC
+        SELECT i.person_id, i.person_type, COALESCE(SUM(vs.duration_seconds), 0) AS total_seconds
+        FROM identities i
+        JOIN visible_sessions vs ON vs.person_id = i.person_id
+        WHERE date(vs.start_time) = ?
+        GROUP BY i.person_id, i.person_type
+        ORDER BY i.person_type ASC, total_seconds DESC, i.person_id ASC
         """, (date_str,))
     else:
         c.execute("""
-        SELECT person_id, COALESCE(SUM(duration_seconds), 0) AS total_seconds
-        FROM visible_sessions
-        GROUP BY person_id
-        ORDER BY total_seconds DESC, person_id ASC
+        SELECT i.person_id, i.person_type, COALESCE(SUM(vs.duration_seconds), 0) AS total_seconds
+        FROM identities i
+        JOIN visible_sessions vs ON vs.person_id = i.person_id
+        GROUP BY i.person_id, i.person_type
+        ORDER BY i.person_type ASC, total_seconds DESC, i.person_id ASC
         """)
 
     rows = c.fetchall()
     conn.close()
 
     return [
-        {"person_id": row[0], "total_visible_seconds": float(row[1] or 0.0)}
+        {
+            "person_id": row[0],
+            "person_type": row[1],
+            "total_visible_seconds": float(row[2] or 0.0),
+        }
         for row in rows
     ]
 
@@ -482,8 +538,11 @@ def get_person_daily_first_last_entry(person_id: str, date_str: str):
     row = c.fetchone()
     conn.close()
 
+    identity = get_identity_info(person_id)
+
     return {
         "person_id": person_id,
+        "person_type": identity["person_type"] if identity else None,
         "date": date_str,
         "first_entry": row[0] if row and row[0] else None,
         "last_entry": row[1] if row and row[1] else None,
@@ -496,13 +555,15 @@ def get_all_daily_first_last_entries(date_str: str):
 
     c.execute("""
     SELECT
-        person_id,
-        MIN(entry_time) AS first_entry,
-        MAX(COALESCE(exit_time, entry_time)) AS last_entry
-    FROM access_sessions
-    WHERE date(entry_time) = ?
-    GROUP BY person_id
-    ORDER BY person_id ASC
+        i.person_id,
+        i.person_type,
+        MIN(a.entry_time) AS first_entry,
+        MAX(COALESCE(a.exit_time, a.entry_time)) AS last_entry
+    FROM identities i
+    JOIN access_sessions a ON a.person_id = i.person_id
+    WHERE date(a.entry_time) = ?
+    GROUP BY i.person_id, i.person_type
+    ORDER BY i.person_type ASC, i.person_id ASC
     """, (date_str,))
 
     rows = c.fetchall()
@@ -511,19 +572,25 @@ def get_all_daily_first_last_entries(date_str: str):
     return [
         {
             "person_id": row[0],
+            "person_type": row[1],
             "date": date_str,
-            "first_entry": row[1],
-            "last_entry": row[2],
+            "first_entry": row[2],
+            "last_entry": row[3],
         }
         for row in rows
     ]
 
 
 def get_person_daily_work_hours(person_id: str, date_str: str):
+    identity = get_identity_info(person_id)
+    if identity is None or identity["person_type"] != "employee":
+        return None
+
     total_seconds = get_person_total_visible_time(person_id, date_str)
 
     return {
         "person_id": person_id,
+        "person_type": "employee",
         "date": date_str,
         "total_visible_seconds": total_seconds,
         "total_visible_hours": round(total_seconds / 3600.0, 4),
@@ -531,14 +598,101 @@ def get_person_daily_work_hours(person_id: str, date_str: str):
 
 
 def get_all_daily_work_hours(date_str: str):
-    totals = get_all_total_visible_times(date_str)
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("""
+    SELECT
+        i.person_id,
+        i.person_type,
+        COALESCE(SUM(vs.duration_seconds), 0) AS total_seconds
+    FROM identities i
+    JOIN visible_sessions vs ON vs.person_id = i.person_id
+    WHERE i.person_type = 'employee'
+      AND date(vs.start_time) = ?
+    GROUP BY i.person_id, i.person_type
+    ORDER BY total_seconds DESC, i.person_id ASC
+    """, (date_str,))
+
+    rows = c.fetchall()
+    conn.close()
 
     return [
         {
-            "person_id": item["person_id"],
+            "person_id": row[0],
+            "person_type": row[1],
             "date": date_str,
-            "total_visible_seconds": item["total_visible_seconds"],
-            "total_visible_hours": round(item["total_visible_seconds"] / 3600.0, 4),
+            "total_visible_seconds": float(row[2] or 0.0),
+            "total_visible_hours": round(float(row[2] or 0.0) / 3600.0, 4),
         }
-        for item in totals
+        for row in rows
     ]
+
+
+def get_grouped_daily_report(date_str: str):
+    appearances = get_all_appearance_counts(date_str)
+    visible_times = get_all_total_visible_times(date_str)
+    first_last = get_all_daily_first_last_entries(date_str)
+    work_hours = get_all_daily_work_hours(date_str)
+
+    grouped = {
+        "employee": {},
+        "visitor": {},
+        "unknown": {},
+    }
+
+    for item in appearances:
+        grouped.setdefault(item["person_type"], {}).setdefault(item["person_id"], {
+            "person_id": item["person_id"],
+            "person_type": item["person_type"],
+            "appearances": 0,
+            "total_visible_seconds": 0.0,
+            "first_entry": None,
+            "last_entry": None,
+            "total_visible_hours": None,
+        })
+        grouped[item["person_type"]][item["person_id"]]["appearances"] = item["appearances"]
+
+    for item in visible_times:
+        grouped.setdefault(item["person_type"], {}).setdefault(item["person_id"], {
+            "person_id": item["person_id"],
+            "person_type": item["person_type"],
+            "appearances": 0,
+            "total_visible_seconds": 0.0,
+            "first_entry": None,
+            "last_entry": None,
+            "total_visible_hours": None,
+        })
+        grouped[item["person_type"]][item["person_id"]]["total_visible_seconds"] = item["total_visible_seconds"]
+
+    for item in first_last:
+        grouped.setdefault(item["person_type"], {}).setdefault(item["person_id"], {
+            "person_id": item["person_id"],
+            "person_type": item["person_type"],
+            "appearances": 0,
+            "total_visible_seconds": 0.0,
+            "first_entry": None,
+            "last_entry": None,
+            "total_visible_hours": None,
+        })
+        grouped[item["person_type"]][item["person_id"]]["first_entry"] = item["first_entry"]
+        grouped[item["person_type"]][item["person_id"]]["last_entry"] = item["last_entry"]
+
+    for item in work_hours:
+        grouped.setdefault(item["person_type"], {}).setdefault(item["person_id"], {
+            "person_id": item["person_id"],
+            "person_type": item["person_type"],
+            "appearances": 0,
+            "total_visible_seconds": 0.0,
+            "first_entry": None,
+            "last_entry": None,
+            "total_visible_hours": None,
+        })
+        grouped[item["person_type"]][item["person_id"]]["total_visible_hours"] = item["total_visible_hours"]
+
+    return {
+        "date": date_str,
+        "employee": list(grouped["employee"].values()),
+        "visitor": list(grouped["visitor"].values()),
+        "unknown": list(grouped["unknown"].values()),
+    }
