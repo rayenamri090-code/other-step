@@ -13,53 +13,79 @@ class SessionService:
     def _ts_to_str(ts: float) -> str:
         return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
-    def on_track_seen(self, track, person_id):
-        now_ts = time.time()
-
-        if track.get("visible_session_start_ts") is None:
-            track["visible_session_start_ts"] = now_ts
-            track["visible_session_start_str"] = self._ts_to_str(now_ts)
-
-        track["last_seen_ts"] = now_ts
-
-        if person_id and not track.get("access_session_open", False):
-            open_access_session(person_id, self.zone_name)
-            track["access_session_open"] = True
-
-    def _finalize_visible_session(self, track, person_id):
+    def _finalize_visible_session(self, track, person_id, end_ts=None):
         start_ts = track.get("visible_session_start_ts")
-        end_ts = track.get("last_seen_ts")
+        last_seen_ts = track.get("last_seen_ts")
 
-        if start_ts is None or end_ts is None:
+        if start_ts is None:
+            return
+
+        if end_ts is None:
+            end_ts = last_seen_ts
+
+        if end_ts is None:
             return
 
         if end_ts < start_ts:
             end_ts = start_ts
 
-        start_str = self._ts_to_str(start_ts)
-        end_str = self._ts_to_str(end_ts)
         duration = max(0.0, end_ts - start_ts)
 
         add_visible_session(
             person_id=person_id,
             camera_id=CAMERA_ID,
             track_id=track["track_id"],
-            start_time=start_str,
-            end_time=end_str,
+            start_time=self._ts_to_str(start_ts),
+            end_time=self._ts_to_str(end_ts),
             duration_seconds=duration,
         )
+
+        track["visible_session_start_ts"] = None
+        track["visible_session_start_str"] = None
 
     def _finalize_access_session(self, track, person_id):
         if track.get("access_session_open", False):
             close_access_session(person_id, self.zone_name)
             track["access_session_open"] = False
 
+    def on_track_seen(self, track, person_id):
+        now_ts = time.time()
+        last_seen_ts = track.get("last_seen_ts")
+
+        # If person was absent long enough, split visible session
+        if (
+            last_seen_ts is not None
+            and track.get("visible_session_start_ts") is not None
+            and (now_ts - last_seen_ts) > VISIBLE_SESSION_TIMEOUT_SEC
+        ):
+            self._finalize_visible_session(track, person_id, end_ts=last_seen_ts)
+
+        # If access gap is too long, close and reopen access session
+        if (
+            last_seen_ts is not None
+            and track.get("access_session_open", False)
+            and (now_ts - last_seen_ts) > ACCESS_SESSION_TIMEOUT_SEC
+        ):
+            self._finalize_access_session(track, person_id)
+
+        # Start a new visible session if needed
+        if track.get("visible_session_start_ts") is None:
+            track["visible_session_start_ts"] = now_ts
+            track["visible_session_start_str"] = self._ts_to_str(now_ts)
+
+        # Start a new access session if needed
+        if person_id and not track.get("access_session_open", False):
+            open_access_session(person_id, self.zone_name)
+            track["access_session_open"] = True
+
+        track["last_seen_ts"] = now_ts
+
     def on_track_removed(self, track):
         person_id = track.get("identity")
         if not person_id:
             return
 
-        self._finalize_visible_session(track, person_id)
+        self._finalize_visible_session(track, person_id, end_ts=track.get("last_seen_ts"))
         self._finalize_access_session(track, person_id)
 
     def should_timeout_visible(self, track, now_ts):
