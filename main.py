@@ -37,31 +37,42 @@ from attribute_service import AttributeService
 
 
 # =========================================================
-# Gender Stability Helpers
+# Attribute Stability Helpers
 # =========================================================
 
-MIN_GENDER_FACE_WIDTH = 120
-MIN_GENDER_FACE_HEIGHT = 120
+MIN_ATTRIBUTE_FACE_WIDTH = 120
+MIN_ATTRIBUTE_FACE_HEIGHT = 120
+
 GENDER_HISTORY_SIZE = 5
 GENDER_MIN_VOTES = 3
 
+AGE_HISTORY_SIZE = 7
+AGE_MIN_VOTES = 4
+
 
 def ensure_track_attribute_fields(track: dict):
-    track.setdefault("gender_prediction", None)          # raw last prediction
-    track.setdefault("gender_confidence", None)          # raw last confidence
+    # Gender
+    track.setdefault("gender_prediction", None)
+    track.setdefault("gender_confidence", None)
     track.setdefault("gender_last_update_ts", 0.0)
     track.setdefault("gender_history", [])
-    track.setdefault("stable_gender", None)              # final displayed stable value
+    track.setdefault("stable_gender", None)
+
+    # Age
+    track.setdefault("age_prediction", None)
+    track.setdefault("age_confidence", None)
+    track.setdefault("age_history", [])
+    track.setdefault("stable_age", None)
 
 
-def should_update_gender(track: dict) -> bool:
+def should_update_attributes(track: dict) -> bool:
     last_ts = track.get("gender_last_update_ts", 0.0)
     return (time.time() - last_ts) >= ATTRIBUTE_UPDATE_COOLDOWN_SEC
 
 
-def face_large_enough_for_gender(track: dict) -> bool:
+def face_large_enough_for_attributes(track: dict) -> bool:
     x, y, w, h = track["bbox"]
-    return w >= MIN_GENDER_FACE_WIDTH and h >= MIN_GENDER_FACE_HEIGHT
+    return w >= MIN_ATTRIBUTE_FACE_WIDTH and h >= MIN_ATTRIBUTE_FACE_HEIGHT
 
 
 def update_stable_gender(track: dict, predicted_gender, confidence):
@@ -90,6 +101,34 @@ def update_stable_gender(track: dict, predicted_gender, confidence):
             track["stable_gender"] = best_gender
         elif best_count >= GENDER_MIN_VOTES:
             track["stable_gender"] = best_gender
+
+
+def update_stable_age(track: dict, predicted_age, confidence):
+    if predicted_age is None:
+        return
+
+    if confidence is None:
+        return
+
+    history = track.setdefault("age_history", [])
+    history.append(predicted_age)
+
+    if len(history) > AGE_HISTORY_SIZE:
+        history.pop(0)
+
+    counts = Counter(history)
+    best_age, best_count = counts.most_common(1)[0]
+
+    current_stable = track.get("stable_age")
+
+    if current_stable is None:
+        if best_count >= AGE_MIN_VOTES:
+            track["stable_age"] = best_age
+    else:
+        if best_age == current_stable:
+            track["stable_age"] = best_age
+        elif best_count >= AGE_MIN_VOTES:
+            track["stable_age"] = best_age
 
 
 # =========================================================
@@ -125,7 +164,7 @@ def draw_track(frame, track, decision=None):
     cv2.putText(
         frame,
         top,
-        (x, max(20, y - 42)),
+        (x, max(20, y - 62)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
         color,
@@ -136,7 +175,7 @@ def draw_track(frame, track, decision=None):
         cv2.putText(
             frame,
             decision,
-            (x, max(20, y - 22)),
+            (x, max(20, y - 42)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
             color,
@@ -146,8 +185,14 @@ def draw_track(frame, track, decision=None):
     stable_gender = track.get("stable_gender")
     raw_gender = track.get("gender_prediction")
     gender_confidence = track.get("gender_confidence")
-
     gender_to_show = stable_gender if stable_gender else raw_gender
+
+    stable_age = track.get("stable_age")
+    raw_age = track.get("age_prediction")
+    age_confidence = track.get("age_confidence")
+    age_to_show = stable_age if stable_age else raw_age
+
+    y_line = max(20, y - 22)
 
     if gender_to_show:
         gender_line = f"Gender: {gender_to_show}"
@@ -157,7 +202,23 @@ def draw_track(frame, track, decision=None):
         cv2.putText(
             frame,
             gender_line,
-            (x, max(20, y - 2)),
+            (x, y_line),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            color,
+            2,
+        )
+        y_line += 20
+
+    if age_to_show:
+        age_line = f"Age: {age_to_show}"
+        if age_confidence is not None:
+            age_line += f" ({age_confidence:.2f})"
+
+        cv2.putText(
+            frame,
+            age_line,
+            (x, y_line),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
             color,
@@ -230,6 +291,8 @@ def _build_live_active_summary(live_tracks: dict):
             "person_type": person_type,
             "live_visible_seconds": live_duration,
             "identity_score": track.get("identity_score"),
+            "stable_gender": track.get("stable_gender"),
+            "stable_age": track.get("stable_age"),
         })
 
     return grouped
@@ -257,6 +320,8 @@ def _print_live_active_section(live_tracks: dict):
             print(f"  - {item['person_id']} (track={item['track_id']})")
             print(f"      active visible time now: {item['live_visible_seconds']:.1f} sec")
             print(f"      live identity score: {item['identity_score']}")
+            print(f"      stable gender: {item['stable_gender']}")
+            print(f"      stable age: {item['stable_age']}")
 
     if not any_data:
         print("\nNo active recognized tracks right now.")
@@ -507,28 +572,51 @@ def main():
                     )
 
                 # -------------------------------------------------
-                # Gender prediction (auxiliary analytics only)
-                # stable smoothing + confidence filtering
+                # Unified attribute prediction: gender + age
                 # -------------------------------------------------
-                if should_update_gender(track) and face_large_enough_for_gender(track):
-                    gender_result = attribute_service.predict_gender(frame, track["bbox"])
-                    new_gender = gender_result.get("gender_prediction")
-                    new_gender_conf = gender_result.get("gender_confidence")
+                if should_update_attributes(track) and face_large_enough_for_attributes(track):
+                    attr_result = attribute_service.predict_attributes(frame, track["bbox"])
+
+                    new_gender = attr_result.get("gender_prediction")
+                    new_gender_conf = attr_result.get("gender_confidence")
+                    new_age = attr_result.get("age_prediction")
+                    new_age_conf = attr_result.get("age_confidence")
 
                     old_stable_gender = track.get("stable_gender")
                     old_raw_gender = track.get("gender_prediction")
-                    old_raw_conf = track.get("gender_confidence")
+                    old_raw_gender_conf = track.get("gender_confidence")
+
+                    old_stable_age = track.get("stable_age")
+                    old_raw_age = track.get("age_prediction")
+                    old_raw_age_conf = track.get("age_confidence")
 
                     track["gender_prediction"] = new_gender
                     track["gender_confidence"] = new_gender_conf
+                    track["age_prediction"] = new_age
+                    track["age_confidence"] = new_age_conf
                     track["gender_last_update_ts"] = now_ts
 
                     update_stable_gender(track, new_gender, new_gender_conf)
+                    update_stable_age(track, new_age, new_age_conf)
 
-                    stable_changed = old_stable_gender != track.get("stable_gender")
-                    raw_changed = (old_raw_gender != new_gender) or (old_raw_conf != new_gender_conf)
+                    stable_gender_changed = old_stable_gender != track.get("stable_gender")
+                    raw_gender_changed = (
+                        old_raw_gender != new_gender or
+                        old_raw_gender_conf != new_gender_conf
+                    )
 
-                    if new_gender and (stable_changed or raw_changed):
+                    stable_age_changed = old_stable_age != track.get("stable_age")
+                    raw_age_changed = (
+                        old_raw_age != new_age or
+                        old_raw_age_conf != new_age_conf
+                    )
+
+                    if (
+                        new_gender or new_age
+                    ) and (
+                        stable_gender_changed or raw_gender_changed or
+                        stable_age_changed or raw_age_changed
+                    ):
                         log_system_event(
                             mqtt_service=mqtt_service,
                             event_type="attribute_updated",
@@ -543,6 +631,10 @@ def main():
                                 "gender_confidence": new_gender_conf,
                                 "stable_gender": track.get("stable_gender"),
                                 "gender_history": track.get("gender_history", []),
+                                "age_prediction": new_age,
+                                "age_confidence": new_age_conf,
+                                "stable_age": track.get("stable_age"),
+                                "age_history": track.get("age_history", []),
                             },
                         )
 

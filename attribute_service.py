@@ -1,9 +1,14 @@
+from pathlib import Path
+
 import cv2
 import numpy as np
+import torch
+import torch.nn.functional as F
+from torchvision import models, transforms
 
 from config import (
-    GENDER_PROTO,
-    GENDER_MODEL,
+    BASE_DIR,
+    MODELS_DIR,
     GENDER_CONFIDENCE_MIN,
 )
 
@@ -13,33 +18,62 @@ class AttributeService:
     Auxiliary attribute analysis only.
     Not for authentication.
     Not for authorization.
+
+    FairFace-based age + gender prediction.
     """
 
     GENDER_LABELS = ["male", "female"]
+    AGE_LABELS = ["0-2", "3-9", "10-19", "20-29", "30-39", "40-49", "50+"]
 
     def __init__(self):
         self.gender_enabled = False
-        self.gender_net = None
+        self.age_enabled = False
+        self.model = None
         self.gender_confidence_min = GENDER_CONFIDENCE_MIN
 
-        if GENDER_PROTO.exists() and GENDER_MODEL.exists():
-            try:
-                self.gender_net = cv2.dnn.readNet(str(GENDER_MODEL), str(GENDER_PROTO))
-                self.gender_enabled = True
-                print("[ATTR] Gender model loaded")
-            except Exception as e:
-                self.gender_enabled = False
-                self.gender_net = None
-                print(f"[ATTR] Gender model load failed: {e}")
-        else:
-            print("[ATTR] Gender model files not found, gender prediction disabled")
+        self.model_path = MODELS_DIR / "fairface_alldata_20191111.pt"
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def _safe_crop_face(self, frame, bbox, pad_ratio=0.15):
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ])
+
+        if self.model_path.exists():
+            try:
+                self.model = models.resnet34(weights=None)
+                self.model.fc = torch.nn.Linear(self.model.fc.in_features, 18)
+
+                state_dict = torch.load(self.model_path, map_location=self.device)
+                self.model.load_state_dict(state_dict)
+                self.model.to(self.device)
+                self.model.eval()
+
+                self.gender_enabled = True
+                self.age_enabled = True
+                print("[ATTR] FairFace age+gender model loaded")
+            except Exception as e:
+                self.model = None
+                self.gender_enabled = False
+                self.age_enabled = False
+                print(f"[ATTR] FairFace model load failed: {e}")
+        else:
+            print("[ATTR] FairFace model file not found, age/gender prediction disabled")
+
+    def _safe_crop_face(self, frame, bbox, pad_ratio=0.22):
         if frame is None or frame.size == 0:
             return None
 
         h, w = frame.shape[:2]
         x, y, bw, bh = bbox
+
+        if bw <= 0 or bh <= 0:
+            return None
 
         pad_x = int(bw * pad_ratio)
         pad_y = int(bh * pad_ratio)
@@ -56,13 +90,28 @@ class AttributeService:
         if crop is None or crop.size == 0:
             return None
 
+        ch, cw = crop.shape[:2]
+        if cw < 60 or ch < 60:
+            return None
+
         return crop
 
-    def predict_gender(self, frame, bbox):
-        if not self.gender_enabled or self.gender_net is None:
+    def _prepare_tensor(self, face_crop):
+        if face_crop is None or face_crop.size == 0:
+            return None
+
+        # OpenCV frame is BGR, convert to RGB for torchvision models
+        rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+        tensor = self.transform(rgb).unsqueeze(0).to(self.device)
+        return tensor
+
+    def predict_attributes(self, frame, bbox):
+        if self.model is None:
             return {
                 "gender_prediction": None,
                 "gender_confidence": None,
+                "age_prediction": None,
+                "age_confidence": None,
             }
 
         face_crop = self._safe_crop_face(frame, bbox)
@@ -70,43 +119,74 @@ class AttributeService:
             return {
                 "gender_prediction": None,
                 "gender_confidence": None,
+                "age_prediction": None,
+                "age_confidence": None,
             }
 
         try:
-            blob = cv2.dnn.blobFromImage(
-                image=face_crop,
-                scalefactor=1.0,
-                size=(227, 227),
-                mean=(78.4263377603, 87.7689143744, 114.895847746),
-                swapRB=False,
-                crop=False,
-            )
-
-            self.gender_net.setInput(blob)
-            preds = self.gender_net.forward().flatten()
-
-            if preds.size < 2:
+            tensor = self._prepare_tensor(face_crop)
+            if tensor is None:
                 return {
                     "gender_prediction": None,
                     "gender_confidence": None,
+                    "age_prediction": None,
+                    "age_confidence": None,
                 }
 
-            idx = int(np.argmax(preds))
-            conf = float(preds[idx])
+            with torch.no_grad():
+                logits = self.model(tensor)
+                logits = logits.squeeze(0)
 
-            if conf < self.gender_confidence_min:
-                return {
-                    "gender_prediction": None,
-                    "gender_confidence": conf,
-                }
+            # FairFace multi-output layout:
+            # race:   0:7
+            # gender: 7:9
+            # age:    9:18
+            gender_logits = logits[7:9]
+            age_logits = logits[9:18]
+
+            gender_probs = F.softmax(gender_logits, dim=0).cpu().numpy()
+            age_probs = F.softmax(age_logits, dim=0).cpu().numpy()
+
+            gender_idx = int(np.argmax(gender_probs))
+            age_idx = int(np.argmax(age_probs))
+
+            gender_conf = float(gender_probs[gender_idx])
+            age_conf = float(age_probs[age_idx])
+
+            gender_prediction = None
+            if gender_conf >= self.gender_confidence_min:
+                gender_prediction = self.GENDER_LABELS[gender_idx]
+
+            age_prediction = self.AGE_LABELS[age_idx]
 
             return {
-                "gender_prediction": self.GENDER_LABELS[idx],
-                "gender_confidence": conf,
+                "gender_prediction": gender_prediction,
+                "gender_confidence": gender_conf,
+                "age_prediction": age_prediction,
+                "age_confidence": age_conf,
             }
 
         except Exception:
             return {
                 "gender_prediction": None,
                 "gender_confidence": None,
+                "age_prediction": None,
+                "age_confidence": None,
             }
+
+    def predict_gender(self, frame, bbox):
+        """
+        Compatibility wrapper so existing main.py keeps working.
+        """
+        result = self.predict_attributes(frame, bbox)
+        return {
+            "gender_prediction": result.get("gender_prediction"),
+            "gender_confidence": result.get("gender_confidence"),
+        }
+
+    def predict_age(self, frame, bbox):
+        result = self.predict_attributes(frame, bbox)
+        return {
+            "age_prediction": result.get("age_prediction"),
+            "age_confidence": result.get("age_confidence"),
+        }
