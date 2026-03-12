@@ -1,21 +1,23 @@
-# virtual env
+# Virtual environment
 .venv/
-venv/
 
-# python cache
+# Python cache
 __pycache__/
 *.pyc
 
-# databases
+# OS / editor
+.vscode/
+.idea/
+
+# Runtime data
+unknown_faces/
 *.db
 *.sqlite
 *.sqlite3
 
-# models / generated files
-*.npy
-*.yml
-*.onnx
+# Legacy training data
+lbph_data/
 
-# OS trash
-.DS_Store
-Thumbs.db
+# Large local models if you do not want them in git
+# models/
+# Or keep only selected models via exceptions if needed
