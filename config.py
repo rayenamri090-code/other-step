@@ -18,9 +18,6 @@ WINDOW_NAME = "Face Tracking Test"
 YUNET_MODEL = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
 SFACE_MODEL = MODELS_DIR / "face_recognition_sface_2021dec.onnx"
 
-# Gender model (optional auxiliary attribute module)
-GENDER_PROTO = MODELS_DIR / "gender_deploy.prototxt"
-GENDER_MODEL = MODELS_DIR / "gender_net.caffemodel"
 
 # =========================================================
 # Camera Identity / Zone
