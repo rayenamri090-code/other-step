@@ -1,4 +1,5 @@
 import cv2
+
 from config import (
     YUNET_MODEL,
     DETECTION_INPUT_SIZE,
@@ -26,9 +27,16 @@ class FaceDetector:
         )
 
     def detect_all(self, frame):
+        if frame is None or frame.size == 0:
+            return []
+
         h, w = frame.shape[:2]
         self.detector.setInputSize((w, h))
-        _, faces = self.detector.detect(frame)
+
+        try:
+            _, faces = self.detector.detect(frame)
+        except Exception:
+            return []
 
         results = []
         if faces is None:
@@ -42,6 +50,15 @@ class FaceDetector:
 
             score = float(row[-1]) if len(row) > 14 else 0.0
             if score < MIN_DETECTION_SCORE:
+                continue
+
+            # clamp bbox to image bounds
+            x = max(0, x)
+            y = max(0, y)
+            fw = min(fw, w - x)
+            fh = min(fh, h - y)
+
+            if fw <= 0 or fh <= 0:
                 continue
 
             results.append({

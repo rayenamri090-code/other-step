@@ -1,5 +1,11 @@
 from math import hypot
-from config import TRACK_MATCH_DISTANCE_PX, TRACK_MAX_MISSING_FRAMES
+from time import time
+
+from config import (
+    TRACK_MATCH_DISTANCE_PX,
+    TRACK_MAX_MISSING_FRAMES,
+    TRACK_MIN_STABLE_FRAMES,
+)
 
 
 class MultiFaceTracker:
@@ -10,7 +16,7 @@ class MultiFaceTracker:
     @staticmethod
     def _center(bbox):
         x, y, w, h = bbox
-        return (x + w / 2, y + h / 2)
+        return (x + w / 2.0, y + h / 2.0)
 
     @staticmethod
     def _distance(b1, b2):
@@ -32,8 +38,8 @@ class MultiFaceTracker:
         inter_h = max(0, yb - ya)
         inter_area = inter_w * inter_h
 
-        area1 = w1 * h1
-        area2 = w2 * h2
+        area1 = max(0, w1) * max(0, h1)
+        area2 = max(0, w2) * max(0, h2)
         union = area1 + area2 - inter_area
 
         if union <= 0:
@@ -49,12 +55,76 @@ class MultiFaceTracker:
             return None
 
         dist_ratio = min(dist / TRACK_MATCH_DISTANCE_PX, 1.0)
+
+        # distance is the main constraint, IoU helps stabilization
         score = (1.0 - dist_ratio) + (0.8 * iou)
         return score
 
+    def _new_track(self, det):
+        now_ts = time()
+        track_id = f"track_{self.next_id:04d}"
+        self.next_id += 1
+
+        return {
+            "track_id": track_id,
+
+            # geometry / detection
+            "bbox": det["bbox"],
+            "prev_bbox": det["bbox"],
+            "face_row": det["face_row"],
+            "det_score": det["score"],
+            "match_score": 1.0,
+
+            # tracking lifecycle
+            "missing_frames": 0,
+            "seen_frames": 1,
+            "updated": True,
+            "track_state": "new",
+
+            # identity decision
+            "identity": None,
+            "identity_type": None,
+            "identity_score": None,
+
+            # candidate identity stabilization
+            "candidate_identity": None,
+            "candidate_identity_type": None,
+            "candidate_identity_score": None,
+            "candidate_identity_hits": 0,
+            "identity_locked": False,
+            "identity_lock_score": None,
+
+            # unknown handling
+            "stable_unknown_frames": 0,
+            "pending_alert_sent": False,
+            "unknown_created": False,
+
+            # timing / session bookkeeping
+            "created_ts": now_ts,
+            "first_seen_ts": now_ts,
+            "last_seen_ts": now_ts,
+            "last_recognition_ts": 0.0,
+            "last_logged_ts": 0.0,
+
+            # visible session bookkeeping
+            "visible_session_start_ts": None,
+            "visible_session_start_str": None,
+            "appearance_count": 0,
+            "total_visible_time_hint_sec": 0.0,
+
+            # access session bookkeeping
+            "access_session_open": False,
+        }
+
     def update(self, detections):
         assigned = set()
+        now_ts = time()
 
+        # mark all tracks as not updated by default for this cycle
+        for track in self.tracks.values():
+            track["updated"] = False
+
+        # match existing tracks to current detections
         for track_id, track in list(self.tracks.items()):
             best_idx = None
             best_score = -1.0
@@ -83,7 +153,12 @@ class MultiFaceTracker:
                 track["seen_frames"] += 1
                 track["updated"] = True
                 track["match_score"] = best_score
-                track["track_state"] = "stable" if track["seen_frames"] >= 3 else "new"
+                track["last_seen_ts"] = now_ts
+
+                if track["seen_frames"] >= TRACK_MIN_STABLE_FRAMES:
+                    track["track_state"] = "stable"
+                else:
+                    track["track_state"] = "new"
             else:
                 track["missing_frames"] += 1
                 track["updated"] = False
@@ -92,54 +167,20 @@ class MultiFaceTracker:
                 if track["missing_frames"] > 0:
                     track["track_state"] = "lost"
 
+        # create tracks for unmatched detections
         for i, det in enumerate(detections):
             if i in assigned:
                 continue
 
-            track_id = f"track_{self.next_id:04d}"
-            self.next_id += 1
+            track = self._new_track(det)
+            self.tracks[track["track_id"]] = track
 
-            self.tracks[track_id] = {
-                "track_id": track_id,
-                "bbox": det["bbox"],
-                "prev_bbox": det["bbox"],
-                "face_row": det["face_row"],
-                "det_score": det["score"],
-                "missing_frames": 0,
-                "seen_frames": 1,
-                "updated": True,
-                "match_score": 1.0,
-                "track_state": "new",
-
-                # current decided identity
-                "identity": None,
-                "identity_type": None,
-                "identity_score": None,
-
-                # stabilization fields for next recognition upgrade
-                "candidate_identity": None,
-                "candidate_identity_type": None,
-                "candidate_identity_score": None,
-                "candidate_identity_hits": 0,
-                "identity_locked": False,
-                "identity_lock_score": None,
-
-                # unknown handling
-                "stable_unknown_frames": 0,
-                "pending_alert_sent": False,
-
-                # session/runtime bookkeeping
-                "visible_session_start_ts": None,
-                "visible_session_start_str": None,
-                "last_seen_ts": None,
-                "last_logged_ts": 0.0,
-                "access_session_open": False,
-            }
-
+        # remove expired tracks
         removed = []
         for track_id, track in list(self.tracks.items()):
             if track["missing_frames"] > TRACK_MAX_MISSING_FRAMES:
-                removed.append(track)
+                track["removed_ts"] = now_ts
+                removed.append(dict(track))
                 del self.tracks[track_id]
 
         return self.tracks, removed
