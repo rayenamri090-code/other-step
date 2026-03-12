@@ -55,8 +55,6 @@ class MultiFaceTracker:
             return None
 
         dist_ratio = min(dist / TRACK_MATCH_DISTANCE_PX, 1.0)
-
-        # distance is the main constraint, IoU helps stabilization
         score = (1.0 - dist_ratio) + (0.8 * iou)
         return score
 
@@ -114,17 +112,24 @@ class MultiFaceTracker:
 
             # access session bookkeeping
             "access_session_open": False,
+
+            # attribute analysis
+            "gender_prediction": None,
+            "gender_confidence": None,
+            "gender_last_update_ts": 0.0,
+
+            "emotion_prediction": None,
+            "emotion_confidence": None,
+            "emotion_last_update_ts": 0.0,
         }
 
     def update(self, detections):
         assigned = set()
         now_ts = time()
 
-        # mark all tracks as not updated by default for this cycle
         for track in self.tracks.values():
             track["updated"] = False
 
-        # match existing tracks to current detections
         for track_id, track in list(self.tracks.items()):
             best_idx = None
             best_score = -1.0
@@ -167,7 +172,6 @@ class MultiFaceTracker:
                 if track["missing_frames"] > 0:
                     track["track_state"] = "lost"
 
-        # create tracks for unmatched detections
         for i, det in enumerate(detections):
             if i in assigned:
                 continue
@@ -175,7 +179,6 @@ class MultiFaceTracker:
             track = self._new_track(det)
             self.tracks[track["track_id"]] = track
 
-        # remove expired tracks
         removed = []
         for track_id, track in list(self.tracks.items()):
             if track["missing_frames"] > TRACK_MAX_MISSING_FRAMES:

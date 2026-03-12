@@ -18,6 +18,10 @@ WINDOW_NAME = "Face Tracking Test"
 YUNET_MODEL = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
 SFACE_MODEL = MODELS_DIR / "face_recognition_sface_2021dec.onnx"
 
+# Gender model (optional auxiliary attribute module)
+GENDER_PROTO = MODELS_DIR / "gender_deploy.prototxt"
+GENDER_MODEL = MODELS_DIR / "gender_net.caffemodel"
+
 # =========================================================
 # Camera Identity / Zone
 # =========================================================
@@ -66,6 +70,12 @@ UNKNOWN_STABLE_FRAMES_REQUIRED = 5
 UNKNOWN_REUSE_THRESHOLD = 0.40
 
 # =========================================================
+# Attribute Analysis
+# =========================================================
+ATTRIBUTE_UPDATE_COOLDOWN_SEC = 2.0
+GENDER_CONFIDENCE_MIN = 0.65
+
+# =========================================================
 # Sessions / Visibility
 # =========================================================
 VISIBLE_SESSION_TIMEOUT_SEC = 10
@@ -92,8 +102,8 @@ MQTT_PORT = 1883
 MQTT_KEEPALIVE = 60
 MQTT_TOPIC_ACCESS = "bizup/access"
 MQTT_TOPIC_ALERT = "bizup/alert"
-MQTT_TOPIC_EVENT = "bizup/event"
 MQTT_TOPIC_SYSTEM = "bizup/system"
+
 # =========================================================
 # Authorization Defaults
 # =========================================================

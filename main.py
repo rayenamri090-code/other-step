@@ -1,5 +1,6 @@
 import time
 from datetime import datetime
+from collections import Counter
 
 import cv2
 
@@ -8,6 +9,8 @@ from config import (
     WINDOW_NAME,
     CAMERA_ID,
     LOG_COOLDOWN_SEC,
+    ATTRIBUTE_UPDATE_COOLDOWN_SEC,
+    GENDER_CONFIDENCE_MIN,
 )
 
 validate_config()
@@ -30,6 +33,63 @@ from identity_service import IdentityService
 from authorization_service import AuthorizationService
 from session_service import SessionService
 from mqtt_service import MQTTService
+from attribute_service import AttributeService
+
+
+# =========================================================
+# Gender Stability Helpers
+# =========================================================
+
+MIN_GENDER_FACE_WIDTH = 120
+MIN_GENDER_FACE_HEIGHT = 120
+GENDER_HISTORY_SIZE = 5
+GENDER_MIN_VOTES = 3
+
+
+def ensure_track_attribute_fields(track: dict):
+    track.setdefault("gender_prediction", None)          # raw last prediction
+    track.setdefault("gender_confidence", None)          # raw last confidence
+    track.setdefault("gender_last_update_ts", 0.0)
+    track.setdefault("gender_history", [])
+    track.setdefault("stable_gender", None)              # final displayed stable value
+
+
+def should_update_gender(track: dict) -> bool:
+    last_ts = track.get("gender_last_update_ts", 0.0)
+    return (time.time() - last_ts) >= ATTRIBUTE_UPDATE_COOLDOWN_SEC
+
+
+def face_large_enough_for_gender(track: dict) -> bool:
+    x, y, w, h = track["bbox"]
+    return w >= MIN_GENDER_FACE_WIDTH and h >= MIN_GENDER_FACE_HEIGHT
+
+
+def update_stable_gender(track: dict, predicted_gender, confidence):
+    if predicted_gender is None:
+        return
+
+    if confidence is None or confidence < GENDER_CONFIDENCE_MIN:
+        return
+
+    history = track.setdefault("gender_history", [])
+    history.append(predicted_gender)
+
+    if len(history) > GENDER_HISTORY_SIZE:
+        history.pop(0)
+
+    counts = Counter(history)
+    best_gender, best_count = counts.most_common(1)[0]
+
+    current_stable = track.get("stable_gender")
+
+    if current_stable is None:
+        if best_count >= GENDER_MIN_VOTES:
+            track["stable_gender"] = best_gender
+    else:
+        if best_gender == current_stable:
+            track["stable_gender"] = best_gender
+        elif best_count >= GENDER_MIN_VOTES:
+            track["stable_gender"] = best_gender
 
 
 # =========================================================
@@ -65,7 +125,7 @@ def draw_track(frame, track, decision=None):
     cv2.putText(
         frame,
         top,
-        (x, max(20, y - 28)),
+        (x, max(20, y - 42)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
         color,
@@ -76,9 +136,30 @@ def draw_track(frame, track, decision=None):
         cv2.putText(
             frame,
             decision,
-            (x, max(20, y - 8)),
+            (x, max(20, y - 22)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
+            color,
+            2,
+        )
+
+    stable_gender = track.get("stable_gender")
+    raw_gender = track.get("gender_prediction")
+    gender_confidence = track.get("gender_confidence")
+
+    gender_to_show = stable_gender if stable_gender else raw_gender
+
+    if gender_to_show:
+        gender_line = f"Gender: {gender_to_show}"
+        if gender_confidence is not None:
+            gender_line += f" ({gender_confidence:.2f})"
+
+        cv2.putText(
+            frame,
+            gender_line,
+            (x, max(20, y - 2)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
             color,
             2,
         )
@@ -276,6 +357,7 @@ def main():
     authorization_service = AuthorizationService()
     session_service = SessionService(zone_id=zone_id, zone_name=zone_name)
     mqtt_service = MQTTService()
+    attribute_service = AttributeService()
 
     mqtt_service.connect()
     camera.open()
@@ -329,6 +411,8 @@ def main():
             )
 
             for track_id, track in live_tracks.items():
+                ensure_track_attribute_fields(track)
+
                 if not track["updated"]:
                     draw_track(frame, track)
                     continue
@@ -421,6 +505,46 @@ def main():
                             "identity_switched": track.get("identity_just_switched", False),
                         },
                     )
+
+                # -------------------------------------------------
+                # Gender prediction (auxiliary analytics only)
+                # stable smoothing + confidence filtering
+                # -------------------------------------------------
+                if should_update_gender(track) and face_large_enough_for_gender(track):
+                    gender_result = attribute_service.predict_gender(frame, track["bbox"])
+                    new_gender = gender_result.get("gender_prediction")
+                    new_gender_conf = gender_result.get("gender_confidence")
+
+                    old_stable_gender = track.get("stable_gender")
+                    old_raw_gender = track.get("gender_prediction")
+                    old_raw_conf = track.get("gender_confidence")
+
+                    track["gender_prediction"] = new_gender
+                    track["gender_confidence"] = new_gender_conf
+                    track["gender_last_update_ts"] = now_ts
+
+                    update_stable_gender(track, new_gender, new_gender_conf)
+
+                    stable_changed = old_stable_gender != track.get("stable_gender")
+                    raw_changed = (old_raw_gender != new_gender) or (old_raw_conf != new_gender_conf)
+
+                    if new_gender and (stable_changed or raw_changed):
+                        log_system_event(
+                            mqtt_service=mqtt_service,
+                            event_type="attribute_updated",
+                            camera_id=CAMERA_ID,
+                            zone_id=zone_id,
+                            track_id=track_id,
+                            person_id=track.get("identity"),
+                            person_type=track.get("identity_type"),
+                            confidence=track.get("identity_score"),
+                            payload={
+                                "gender_prediction": new_gender,
+                                "gender_confidence": new_gender_conf,
+                                "stable_gender": track.get("stable_gender"),
+                                "gender_history": track.get("gender_history", []),
+                            },
+                        )
 
                 person_id = track.get("identity")
                 person_type = track.get("identity_type")
