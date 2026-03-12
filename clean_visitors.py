@@ -23,7 +23,23 @@ def fetch_visitors():
     return rows
 
 
+def visitor_exists(person_id: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT 1 FROM identities
+        WHERE person_id = ? AND person_type = 'visitor'
+    """, (person_id,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+
 def delete_visitor(person_id: str):
+    if not visitor_exists(person_id):
+        print(f"[ERROR] Visitor '{person_id}' does NOT exist.")
+        return False
+
     conn = get_conn()
     c = conn.cursor()
 
@@ -38,6 +54,9 @@ def delete_visitor(person_id: str):
 
     conn.commit()
     conn.close()
+
+    print(f"[OK] Visitor '{person_id}' deleted successfully.")
+    return True
 
 
 def delete_all_visitors():
@@ -92,8 +111,9 @@ def main():
             print("Cancelled.")
             return
 
-        delete_visitor(person_id)
-        print(f"Deleted visitor data for {person_id}")
+        success = delete_visitor(person_id)
+        if not success:
+            print("[INFO] Nothing was deleted.")
 
     elif choice == "2":
         confirm = input("Type DELETE to remove ALL visitors: ").strip()
@@ -102,7 +122,7 @@ def main():
             return
 
         deleted = delete_all_visitors()
-        print(f"Deleted {len(deleted)} visitor(s): {deleted}")
+        print(f"[OK] Deleted {len(deleted)} visitor(s).")
 
     else:
         print("Invalid choice. Cancelled.")

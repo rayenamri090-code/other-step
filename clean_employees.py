@@ -23,7 +23,23 @@ def fetch_employees():
     return rows
 
 
+def employee_exists(person_id: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT 1 FROM identities
+        WHERE person_id = ? AND person_type = 'employee'
+    """, (person_id,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+
 def delete_employee(person_id: str):
+    if not employee_exists(person_id):
+        print(f"[ERROR] Employee '{person_id}' does NOT exist.")
+        return False
+
     conn = get_conn()
     c = conn.cursor()
 
@@ -39,24 +55,19 @@ def delete_employee(person_id: str):
     conn.commit()
     conn.close()
 
+    print(f"[OK] Employee '{person_id}' deleted successfully.")
+    return True
 
-def delete_all_employees(exclude_demo=True):
+
+def delete_all_employees():
     conn = get_conn()
     c = conn.cursor()
 
-    if exclude_demo:
-        c.execute("""
-            SELECT person_id
-            FROM identities
-            WHERE person_type = 'employee' AND person_id != 'emp_001'
-        """)
-    else:
-        c.execute("""
-            SELECT person_id
-            FROM identities
-            WHERE person_type = 'employee'
-        """)
-
+    c.execute("""
+        SELECT person_id
+        FROM identities
+        WHERE person_type = 'employee'
+    """)
     person_ids = [row[0] for row in c.fetchall()]
     conn.close()
 
@@ -85,9 +96,8 @@ def main():
 
     print("\nOptions:")
     print("1. Delete one employee")
-    print("2. Delete all employees except emp_001")
-    print("3. Delete ALL employees including emp_001")
-    choice = input("\nChoose (1/2/3): ").strip()
+    print("2. Delete all employees")
+    choice = input("\nChoose (1/2): ").strip()
 
     if choice == "1":
         person_id = input("Enter employee person_id to delete: ").strip()
@@ -100,26 +110,18 @@ def main():
             print("Cancelled.")
             return
 
-        delete_employee(person_id)
-        print(f"Deleted employee data for {person_id}")
+        success = delete_employee(person_id)
+        if not success:
+            print("[INFO] Nothing was deleted.")
 
     elif choice == "2":
-        confirm = input("Type DELETE to remove all employees except emp_001: ").strip()
-        if confirm != "DELETE":
-            print("Cancelled.")
-            return
-
-        deleted = delete_all_employees(exclude_demo=True)
-        print(f"Deleted {len(deleted)} employee(s): {deleted}")
-
-    elif choice == "3":
         confirm = input("Type DELETE to remove ALL employees: ").strip()
         if confirm != "DELETE":
             print("Cancelled.")
             return
 
-        deleted = delete_all_employees(exclude_demo=False)
-        print(f"Deleted {len(deleted)} employee(s): {deleted}")
+        deleted = delete_all_employees()
+        print(f"[OK] Deleted {len(deleted)} employee(s).")
 
     else:
         print("Invalid choice. Cancelled.")
