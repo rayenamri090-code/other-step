@@ -294,9 +294,88 @@ def _build_live_active_summary(live_tracks: dict):
             "identity_score": track.get("identity_score"),
             "stable_gender": track.get("stable_gender"),
             "stable_age": track.get("stable_age"),
+            "access_granted_count": track.get("access_granted_count", 0),
+            "access_denied_count": track.get("access_denied_count", 0),
+            "access_alert_count": track.get("access_alert_count", 0),
         })
 
     return grouped
+
+
+def _merge_historical_and_live(report: dict, live_summary: dict):
+    merged = {
+        "employee": {},
+        "visitor": {},
+        "unknown": {},
+    }
+
+    for group_name in ("employee", "visitor", "unknown"):
+        # Start from historical DB report
+        for item in report[group_name]:
+            merged[group_name][item["person_id"]] = {
+                "person_id": item["person_id"],
+                "person_type": item["person_type"],
+                "historical_appearances": item.get("appearances", 0),
+                "historical_visible_seconds": item.get("total_visible_seconds", 0.0) or 0.0,
+                "effective_visible_seconds": item.get("total_visible_seconds", 0.0) or 0.0,
+                "live_visible_seconds": 0.0,
+                "first_entry": item.get("first_entry"),
+                "last_entry": item.get("last_entry"),
+                "total_visible_hours": item.get("total_visible_hours"),
+                "is_live_now": False,
+                "live_track_id": None,
+                "identity_score": None,
+                "stable_gender": None,
+                "stable_age": None,
+                "access_granted_count": 0,
+                "access_denied_count": 0,
+                "access_alert_count": 0,
+            }
+
+        # Add live layer
+        for live_item in live_summary[group_name]:
+            person_id = live_item["person_id"]
+
+            if person_id not in merged[group_name]:
+                merged[group_name][person_id] = {
+                    "person_id": person_id,
+                    "person_type": live_item["person_type"],
+                    "historical_appearances": 0,
+                    "historical_visible_seconds": 0.0,
+                    "effective_visible_seconds": 0.0,
+                    "live_visible_seconds": 0.0,
+                    "first_entry": None,
+                    "last_entry": None,
+                    "total_visible_hours": None,
+                    "is_live_now": False,
+                    "live_track_id": None,
+                    "identity_score": None,
+                    "stable_gender": None,
+                    "stable_age": None,
+                    "access_granted_count": 0,
+                    "access_denied_count": 0,
+                    "access_alert_count": 0,
+                }
+
+            merged[group_name][person_id]["live_visible_seconds"] += live_item.get("live_visible_seconds", 0.0) or 0.0
+            merged[group_name][person_id]["effective_visible_seconds"] += live_item.get("live_visible_seconds", 0.0) or 0.0
+            merged[group_name][person_id]["is_live_now"] = True
+            merged[group_name][person_id]["live_track_id"] = live_item.get("track_id")
+            merged[group_name][person_id]["identity_score"] = live_item.get("identity_score")
+            merged[group_name][person_id]["stable_gender"] = live_item.get("stable_gender")
+            merged[group_name][person_id]["stable_age"] = live_item.get("stable_age")
+            merged[group_name][person_id]["access_granted_count"] += live_item.get("access_granted_count", 0)
+            merged[group_name][person_id]["access_denied_count"] += live_item.get("access_denied_count", 0)
+            merged[group_name][person_id]["access_alert_count"] += live_item.get("access_alert_count", 0)
+
+        # Sort by effective visible time descending
+        merged[group_name] = sorted(
+            merged[group_name].values(),
+            key=lambda x: (x.get("effective_visible_seconds", 0.0), x["person_id"]),
+            reverse=True,
+        )
+
+    return merged
 
 
 def _print_live_active_section(live_tracks: dict):
@@ -323,6 +402,9 @@ def _print_live_active_section(live_tracks: dict):
             print(f"      live identity score: {item['identity_score']}")
             print(f"      stable gender: {item['stable_gender']}")
             print(f"      stable age: {item['stable_age']}")
+            print(f"      authorized count: {item['access_granted_count']}")
+            print(f"      denied count:     {item['access_denied_count']}")
+            print(f"      alert count:      {item['access_alert_count']}")
 
     if not any_data:
         print("\nNo active recognized tracks right now.")
@@ -330,18 +412,65 @@ def _print_live_active_section(live_tracks: dict):
     print("-" * 70 + "\n")
 
 
+def _print_effective_group_section(title: str, items: list, include_work_hours: bool):
+    print(f"\n[{title} - EFFECTIVE TOTAL NOW]")
+
+    if not items:
+        print("  No data.")
+        return
+
+    for item in items:
+        hist_sec = item.get("historical_visible_seconds", 0.0) or 0.0
+        live_sec = item.get("live_visible_seconds", 0.0) or 0.0
+        eff_sec = item.get("effective_visible_seconds", 0.0) or 0.0
+
+        print(f"  - {item['person_id']}")
+        print(f"      historical visible time: {hist_sec:.1f} sec ({hist_sec / 60.0:.2f} min)")
+        print(f"      live visible time now:   {live_sec:.1f} sec ({live_sec / 60.0:.2f} min)")
+        print(f"      effective total now:     {eff_sec:.1f} sec ({eff_sec / 60.0:.2f} min)")
+        print(f"      historical appearances:  {item.get('historical_appearances', 0)}")
+        print(f"      live now:                {item.get('is_live_now', False)}")
+        print(f"      first entry:             {item.get('first_entry')}")
+        print(f"      last entry:              {item.get('last_entry')}")
+
+        if item.get("is_live_now"):
+            print(f"      active track:            {item.get('live_track_id')}")
+            print(f"      live identity score:     {item.get('identity_score')}")
+            print(f"      stable gender:           {item.get('stable_gender')}")
+            print(f"      stable age:              {item.get('stable_age')}")
+            print(f"      authorized count:        {item.get('access_granted_count', 0)}")
+            print(f"      denied count:            {item.get('access_denied_count', 0)}")
+            print(f"      alert count:             {item.get('access_alert_count', 0)}")
+
+        if include_work_hours:
+            total_hours = item.get("total_visible_hours")
+            if total_hours is None:
+                total_hours = round(eff_sec / 3600.0, 4)
+            print(f"      work hours estimate now: {total_hours:.4f} hour(s)")
+
+
 def print_daily_report(date_str: str, live_tracks: dict):
     report = get_grouped_daily_report(date_str)
+    live_summary = _build_live_active_summary(live_tracks)
+    effective = _merge_historical_and_live(report, live_summary)
 
     print("\n" + "=" * 70)
     print(f"[REPORT] Daily analytics for {report['date']}")
     print("=" * 70)
 
+    print("\n[HISTORICAL FINALIZED DATA]")
     _print_group_section("EMPLOYEES", report["employee"], include_work_hours=True)
     _print_group_section("VISITORS", report["visitor"], include_work_hours=False)
     _print_group_section("UNKNOWN", report["unknown"], include_work_hours=False)
 
     _print_live_active_section(live_tracks)
+
+    print("\n" + "-" * 70)
+    print("[EFFECTIVE TOTALS = HISTORICAL + LIVE ACTIVE NOW]")
+    print("-" * 70)
+    _print_effective_group_section("EMPLOYEES", effective["employee"], include_work_hours=True)
+    _print_effective_group_section("VISITORS", effective["visitor"], include_work_hours=False)
+    _print_effective_group_section("UNKNOWN", effective["unknown"], include_work_hours=False)
 
     print("=" * 70 + "\n")
 
@@ -433,7 +562,7 @@ def main():
     print(f"[INFO] Zone ID: {zone_id}")
     print(f"[INFO] Zone Name: {zone_name}")
     print("[INFO] Press Q to quit")
-    print("[INFO] Press R to print today's analytics report + live active tracks")
+    print("[INFO] Press R to print today's analytics report + live active tracks + effective totals")
 
     prev_time = time.time()
     fps = 0.0
@@ -675,6 +804,8 @@ def main():
                     zone_name=zone_name,
                     zone_id=zone_id,
                 )
+
+                session_service.record_access_decision(track, decision)
 
                 if person_id and person_type in ("employee", "visitor", "unknown"):
                     update_last_seen(person_id)
