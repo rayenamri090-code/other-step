@@ -54,7 +54,6 @@ def ensure_track_attribute_fields(track: dict):
     # Gender
     track.setdefault("gender_prediction", None)
     track.setdefault("gender_confidence", None)
-    track.setdefault("gender_last_update_ts", 0.0)
     track.setdefault("gender_history", [])
     track.setdefault("stable_gender", None)
 
@@ -64,9 +63,12 @@ def ensure_track_attribute_fields(track: dict):
     track.setdefault("age_history", [])
     track.setdefault("stable_age", None)
 
+    # Shared attribute update timestamp
+    track.setdefault("attribute_last_update_ts", 0.0)
+
 
 def should_update_attributes(track: dict) -> bool:
-    last_ts = track.get("gender_last_update_ts", 0.0)
+    last_ts = track.get("attribute_last_update_ts", 0.0)
     return (time.time() - last_ts) >= ATTRIBUTE_UPDATE_COOLDOWN_SEC
 
 
@@ -574,7 +576,11 @@ def main():
                 # -------------------------------------------------
                 # Unified attribute prediction: gender + age
                 # -------------------------------------------------
-                if should_update_attributes(track) and face_large_enough_for_attributes(track):
+                if (
+                    should_update_attributes(track)
+                    and face_large_enough_for_attributes(track)
+                    and track.get("identity_type") in ("employee", "visitor", "unknown")
+                ):
                     attr_result = attribute_service.predict_attributes(frame, track["bbox"])
 
                     new_gender = attr_result.get("gender_prediction")
@@ -594,28 +600,32 @@ def main():
                     track["gender_confidence"] = new_gender_conf
                     track["age_prediction"] = new_age
                     track["age_confidence"] = new_age_conf
-                    track["gender_last_update_ts"] = now_ts
+                    track["attribute_last_update_ts"] = now_ts
 
                     update_stable_gender(track, new_gender, new_gender_conf)
                     update_stable_age(track, new_age, new_age_conf)
 
                     stable_gender_changed = old_stable_gender != track.get("stable_gender")
+                    stable_age_changed = old_stable_age != track.get("stable_age")
+
                     raw_gender_changed = (
-                        old_raw_gender != new_gender or
-                        old_raw_gender_conf != new_gender_conf
+                        old_raw_gender != new_gender
+                        or round(old_raw_gender_conf or 0.0, 3) != round(new_gender_conf or 0.0, 3)
                     )
 
-                    stable_age_changed = old_stable_age != track.get("stable_age")
                     raw_age_changed = (
-                        old_raw_age != new_age or
-                        old_raw_age_conf != new_age_conf
+                        old_raw_age != new_age
+                        or round(old_raw_age_conf or 0.0, 3) != round(new_age_conf or 0.0, 3)
                     )
 
                     if (
-                        new_gender or new_age
-                    ) and (
-                        stable_gender_changed or raw_gender_changed or
-                        stable_age_changed or raw_age_changed
+                        (new_gender or new_age)
+                        and (
+                            stable_gender_changed
+                            or raw_gender_changed
+                            or stable_age_changed
+                            or raw_age_changed
+                        )
                     ):
                         log_system_event(
                             mqtt_service=mqtt_service,

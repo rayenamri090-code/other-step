@@ -1,16 +1,10 @@
-from pathlib import Path
-
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision import models, transforms
 
-from config import (
-    BASE_DIR,
-    MODELS_DIR,
-    GENDER_CONFIDENCE_MIN,
-)
+from config import MODELS_DIR, GENDER_CONFIDENCE_MIN
 
 
 class AttributeService:
@@ -23,7 +17,17 @@ class AttributeService:
     """
 
     GENDER_LABELS = ["male", "female"]
-    AGE_LABELS = ["0-2", "3-9", "10-19", "20-29", "30-39", "40-49", "50+"]
+    AGE_LABELS = [
+        "0-2",
+        "3-9",
+        "10-19",
+        "20-29",
+        "30-39",
+        "40-49",
+        "50-59",
+        "60-69",
+        "70+",
+    ]
 
     def __init__(self):
         self.gender_enabled = False
@@ -65,6 +69,14 @@ class AttributeService:
         else:
             print("[ATTR] FairFace model file not found, age/gender prediction disabled")
 
+    def _empty_result(self):
+        return {
+            "gender_prediction": None,
+            "gender_confidence": None,
+            "age_prediction": None,
+            "age_confidence": None,
+        }
+
     def _safe_crop_face(self, frame, bbox, pad_ratio=0.22):
         if frame is None or frame.size == 0:
             return None
@@ -100,49 +112,42 @@ class AttributeService:
         if face_crop is None or face_crop.size == 0:
             return None
 
-        # OpenCV frame is BGR, convert to RGB for torchvision models
         rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
         tensor = self.transform(rgb).unsqueeze(0).to(self.device)
         return tensor
 
     def predict_attributes(self, frame, bbox):
         if self.model is None:
-            return {
-                "gender_prediction": None,
-                "gender_confidence": None,
-                "age_prediction": None,
-                "age_confidence": None,
-            }
+            return self._empty_result()
 
         face_crop = self._safe_crop_face(frame, bbox)
         if face_crop is None:
-            return {
-                "gender_prediction": None,
-                "gender_confidence": None,
-                "age_prediction": None,
-                "age_confidence": None,
-            }
+            return self._empty_result()
 
         try:
             tensor = self._prepare_tensor(face_crop)
             if tensor is None:
-                return {
-                    "gender_prediction": None,
-                    "gender_confidence": None,
-                    "age_prediction": None,
-                    "age_confidence": None,
-                }
+                return self._empty_result()
 
             with torch.no_grad():
-                logits = self.model(tensor)
-                logits = logits.squeeze(0)
+                logits = self.model(tensor).squeeze(0)
 
-            # FairFace multi-output layout:
-            # race:   0:7
-            # gender: 7:9
-            # age:    9:18
+            # FairFace flattened output layout:
+            # race   = logits[0:7]
+            # gender = logits[7:9]
+            # age    = logits[9:18]
             gender_logits = logits[7:9]
             age_logits = logits[9:18]
+
+            if len(self.GENDER_LABELS) != len(gender_logits):
+                raise ValueError(
+                    f"GENDER_LABELS has {len(self.GENDER_LABELS)} labels but model returned {len(gender_logits)} gender logits"
+                )
+
+            if len(self.AGE_LABELS) != len(age_logits):
+                raise ValueError(
+                    f"AGE_LABELS has {len(self.AGE_LABELS)} labels but model returned {len(age_logits)} age logits"
+                )
 
             gender_probs = F.softmax(gender_logits, dim=0).cpu().numpy()
             age_probs = F.softmax(age_logits, dim=0).cpu().numpy()
@@ -166,18 +171,11 @@ class AttributeService:
                 "age_confidence": age_conf,
             }
 
-        except Exception:
-            return {
-                "gender_prediction": None,
-                "gender_confidence": None,
-                "age_prediction": None,
-                "age_confidence": None,
-            }
+        except Exception as e:
+            print(f"[ATTR] Prediction failed: {e}")
+            return self._empty_result()
 
     def predict_gender(self, frame, bbox):
-        """
-        Compatibility wrapper so existing main.py keeps working.
-        """
         result = self.predict_attributes(frame, bbox)
         return {
             "gender_prediction": result.get("gender_prediction"),
