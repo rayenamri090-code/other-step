@@ -28,7 +28,7 @@ class AuthorizationService:
         conn.close()
         return row["role_name"] if row else None
 
-    def _visitor_valid(self, person_id):
+    def _visitor_validity_status(self, person_id):
         conn = self._conn()
         c = conn.cursor()
         c.execute("""
@@ -40,12 +40,19 @@ class AuthorizationService:
         conn.close()
 
         if not row or not row["valid_from"] or not row["valid_to"]:
-            return False
+            return False, "Visitor validity window missing"
 
         now = datetime.now()
         vf = datetime.strptime(row["valid_from"], "%Y-%m-%d %H:%M:%S")
         vt = datetime.strptime(row["valid_to"], "%Y-%m-%d %H:%M:%S")
-        return vf <= now <= vt
+
+        if now < vf:
+            return False, "Visitor validity window not started yet"
+
+        if now > vt:
+            return False, "Visitor validity window expired"
+
+        return True, "Visitor validity window active"
 
     def _policy_match(self, subject_type, subject_value, zone_id):
         day_name, time_now = self._current_day_and_time()
@@ -78,14 +85,16 @@ class AuthorizationService:
         return False
 
     def _fallback_if_no_policy(self, person_type):
-        # For prototype stage:
-        # - employees can default allow if no rule exists and config says so
-        # - visitors should still require explicit policy
+        # Prototype-friendly fallback:
+        # if global default deny is enabled, deny everyone without a rule
         if self.default_deny_if_no_rule:
             return "DENIED", "No matching access policy"
 
         if person_type == "employee":
             return "AUTHORIZED", "No policy found, default employee allow"
+
+        if person_type == "visitor":
+            return "AUTHORIZED", "Visitor valid and no policy found, default visitor allow"
 
         return "DENIED", "No matching access policy"
 
@@ -113,8 +122,9 @@ class AuthorizationService:
             return self._fallback_if_no_policy("employee")
 
         if person_type == "visitor":
-            if not self._visitor_valid(person_id):
-                return "DENIED", "Visitor validity window expired"
+            valid, validity_reason = self._visitor_validity_status(person_id)
+            if not valid:
+                return "DENIED", validity_reason
 
             if self._policy_match("visitor", person_id, zone_id):
                 return "AUTHORIZED", "Visitor policy matched"

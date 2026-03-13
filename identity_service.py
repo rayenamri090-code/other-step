@@ -25,6 +25,12 @@ UNKNOWN_ENRICH_MAX_EXTRA_EMBEDDINGS_PER_TRACK = 3
 UNKNOWN_ENRICH_COOLDOWN_SEC = 1.5
 UNKNOWN_ENRICH_MIN_DISTANCE = 0.08
 
+# =========================================================
+# Stronger unknown reuse / creation stabilization
+# =========================================================
+UNKNOWN_REUSE_CONFIRM_FRAMES = 2
+UNKNOWN_CREATE_CONFIRM_FRAMES = 3
+
 
 class IdentityService:
     def __init__(self, recognizer, camera_id, zone_id=None):
@@ -46,6 +52,12 @@ class IdentityService:
         track["candidate_identity_type"] = None
         track["candidate_identity_score"] = None
         track["candidate_identity_hits"] = 0
+
+    def _reset_unknown_resolution_state(self, track):
+        track["unknown_reuse_candidate_id"] = None
+        track["unknown_reuse_candidate_score"] = None
+        track["unknown_reuse_candidate_hits"] = 0
+        track["unknown_no_reuse_frames"] = 0
 
     def _clear_runtime_flags(self, track):
         track["identity_just_confirmed"] = False
@@ -78,6 +90,7 @@ class IdentityService:
         track["identity_lock_score"] = score if track["identity_locked"] else None
 
         self._reset_candidate(track)
+        self._reset_unknown_resolution_state(track)
 
         track["identity_just_confirmed"] = True
         track["identity_just_switched"] = (
@@ -199,6 +212,7 @@ class IdentityService:
                     track["identity_lock_score"] = matched_score
                     track["stable_unknown_frames"] = 0
                     self._reset_candidate(track)
+                    self._reset_unknown_resolution_state(track)
 
                     if matched_type == "unknown":
                         self._maybe_enrich_unknown_identity(track, embedding)
@@ -225,6 +239,7 @@ class IdentityService:
                 track["identity_score"] = matched_score
                 track["stable_unknown_frames"] = 0
                 self._reset_candidate(track)
+                self._reset_unknown_resolution_state(track)
 
                 if matched_score >= self.min_lock_score:
                     track["identity_locked"] = True
@@ -259,6 +274,7 @@ class IdentityService:
         if track.get("identity") is not None and track.get("identity_type") != "unknown_candidate":
             track["stable_unknown_frames"] = 0
             self._reset_candidate(track)
+            self._reset_unknown_resolution_state(track)
             return track
 
         track["stable_unknown_frames"] = track.get("stable_unknown_frames", 0) + 1
@@ -286,12 +302,32 @@ class IdentityService:
 
         return None
 
+    def _update_unknown_reuse_candidate(self, track, reused):
+        candidate_id = track.get("unknown_reuse_candidate_id")
+
+        if reused is None:
+            track["unknown_reuse_candidate_id"] = None
+            track["unknown_reuse_candidate_score"] = None
+            track["unknown_reuse_candidate_hits"] = 0
+            track["unknown_no_reuse_frames"] = track.get("unknown_no_reuse_frames", 0) + 1
+            return
+
+        if candidate_id == reused["person_id"]:
+            track["unknown_reuse_candidate_hits"] = track.get("unknown_reuse_candidate_hits", 0) + 1
+            track["unknown_reuse_candidate_score"] = reused["score"]
+        else:
+            track["unknown_reuse_candidate_id"] = reused["person_id"]
+            track["unknown_reuse_candidate_score"] = reused["score"]
+            track["unknown_reuse_candidate_hits"] = 1
+
+        track["unknown_no_reuse_frames"] = 0
+
     def convert_unknown_candidate_if_stable(self, track, embedding):
         # if already resolved to a proper identity, do nothing
         if track.get("identity") is not None and track.get("identity_type") != "unknown_candidate":
             return None
 
-        # do not create unknown too early
+        # do not create/reuse unknown too early
         if track.get("stable_unknown_frames", 0) < UNKNOWN_STABLE_FRAMES_REQUIRED:
             return None
 
@@ -300,8 +336,17 @@ class IdentityService:
             return track.get("identity")
 
         reused = self._try_reuse_existing_unknown(embedding)
-        if reused is not None:
-            self._set_confirmed_identity(track, reused["person_id"], "unknown", reused["score"])
+        self._update_unknown_reuse_candidate(track, reused)
+
+        # -------------------------------------------------
+        # 1. Strong reuse path
+        # -------------------------------------------------
+        reuse_candidate_id = track.get("unknown_reuse_candidate_id")
+        reuse_candidate_hits = track.get("unknown_reuse_candidate_hits", 0)
+        reuse_candidate_score = track.get("unknown_reuse_candidate_score")
+
+        if reuse_candidate_id and reuse_candidate_hits >= UNKNOWN_REUSE_CONFIRM_FRAMES:
+            self._set_confirmed_identity(track, reuse_candidate_id, "unknown", reuse_candidate_score)
             track["unknown_just_reused"] = True
 
             track["unknown_created"] = True
@@ -309,7 +354,14 @@ class IdentityService:
             track["unknown_last_embedding_save_ts"] = time.time()
             track["unknown_last_saved_embedding"] = np.asarray(embedding, dtype=np.float32).copy()
 
-            return reused["person_id"]
+            return reuse_candidate_id
+
+        # -------------------------------------------------
+        # 2. Create new unknown only after repeated no-reuse evidence
+        # -------------------------------------------------
+        no_reuse_frames = track.get("unknown_no_reuse_frames", 0)
+        if no_reuse_frames < UNKNOWN_CREATE_CONFIRM_FRAMES:
+            return None
 
         person_id = create_unknown_identity()
         emb_json = json.dumps(np.asarray(embedding, dtype=float).tolist())
