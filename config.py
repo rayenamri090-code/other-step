@@ -4,23 +4,14 @@ BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
 
 # =========================================================
-# Camera Source
-# =========================================================
-CAMERA_SOURCE = 0
-CAMERA_INDEX = 0
-FRAME_WIDTH = 960
-FRAME_HEIGHT = 540
-WINDOW_NAME = "Face Tracking Test"
-
-# =========================================================
 # Models
 # =========================================================
 YUNET_MODEL = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
 SFACE_MODEL = MODELS_DIR / "face_recognition_sface_2021dec.onnx"
 
-
 # =========================================================
 # Camera Identity / Zone
+# These are logical identifiers, not hardware calibration.
 # =========================================================
 CAMERA_ID = "cam_001"
 DEFAULT_ZONE_ID = "zone_main_entrance"
@@ -29,8 +20,16 @@ DEFAULT_ZONE_TYPE = "access"
 DEFAULT_IS_ACCESS_POINT = 1
 
 # =========================================================
-# Detection
+# Camera Source / Hardware Calibration
+# These values are provisional for the current PC camera.
+# Recalibrate later when switching to Raspberry camera.
 # =========================================================
+CAMERA_SOURCE = 0
+FRAME_WIDTH = 960
+FRAME_HEIGHT = 540
+WINDOW_NAME = "Face Tracking Test"
+
+# Detection calibration
 DETECTION_INPUT_SIZE = (320, 320)
 SCORE_THRESHOLD = 0.82
 NMS_THRESHOLD = 0.30
@@ -40,15 +39,17 @@ MIN_FACE_WIDTH = 80
 MIN_FACE_HEIGHT = 80
 MIN_DETECTION_SCORE = 0.82
 
-# =========================================================
-# Tracking
-# =========================================================
+MIN_ATTRIBUTE_FACE_WIDTH = 120
+MIN_ATTRIBUTE_FACE_HEIGHT = 120
+
+# Tracking calibration
 TRACK_MATCH_DISTANCE_PX = 120
 TRACK_MAX_MISSING_FRAMES = 10
 TRACK_MIN_STABLE_FRAMES = 3
 
 # =========================================================
-# Recognition
+# Recognition / Identity Logic
+# Mostly camera-independent business logic.
 # =========================================================
 RECOGNITION_MATCH_THRESHOLD = 0.45
 RECOGNITION_COOLDOWN_SEC = 2.0
@@ -60,20 +61,23 @@ IDENTITY_LOCK_MIN_SCORE = 0.55
 IDENTITY_UNLOCK_STRONGER_SCORE_DIFF = 0.08
 
 # =========================================================
-# Unknown Handling
+# Unknown Handling Logic
 # =========================================================
 UNKNOWN_EMBEDDINGS_TO_SAVE = 5
 UNKNOWN_STABLE_FRAMES_REQUIRED = 5
 UNKNOWN_REUSE_THRESHOLD = 0.40
 
 # =========================================================
-# Attribute Analysis
+# Attribute Analysis Logic
+# Face size thresholds for attributes are currently defined
+# in main.py and can later be moved here if you want full
+# calibration centralization.
 # =========================================================
 ATTRIBUTE_UPDATE_COOLDOWN_SEC = 2.0
 GENDER_CONFIDENCE_MIN = 0.65
 
 # =========================================================
-# Sessions / Visibility
+# Sessions / Visibility Logic
 # =========================================================
 VISIBLE_SESSION_TIMEOUT_SEC = 10
 ACCESS_SESSION_TIMEOUT_SEC = 30

@@ -11,6 +11,8 @@ from config import (
     LOG_COOLDOWN_SEC,
     ATTRIBUTE_UPDATE_COOLDOWN_SEC,
     GENDER_CONFIDENCE_MIN,
+    MIN_ATTRIBUTE_FACE_WIDTH,
+    MIN_ATTRIBUTE_FACE_HEIGHT,
 )
 
 validate_config()
@@ -39,9 +41,6 @@ from attribute_service import AttributeService
 # =========================================================
 # Attribute Stability Helpers
 # =========================================================
-
-MIN_ATTRIBUTE_FACE_WIDTH = 120
-MIN_ATTRIBUTE_FACE_HEIGHT = 120
 
 GENDER_HISTORY_SIZE = 5
 GENDER_MIN_VOTES = 3
@@ -436,6 +435,9 @@ def main():
     print("[INFO] Press Q to quit")
     print("[INFO] Press R to print today's analytics report + live active tracks")
 
+    prev_time = time.time()
+    fps = 0.0
+
     try:
         while True:
             ok, frame = camera.read()
@@ -467,6 +469,12 @@ def main():
                         },
                     )
 
+            current_time = time.time()
+            dt = current_time - prev_time
+            if dt > 0:
+                fps = 1.0 / dt
+            prev_time = current_time
+
             cv2.putText(
                 frame,
                 f"Cam:{CAMERA_ID} Zone:{zone_name} Faces:{len(detections)} Tracks:{len(live_tracks)}",
@@ -474,6 +482,16 @@ def main():
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 (255, 255, 255),
+                2,
+            )
+
+            cv2.putText(
+                frame,
+                f"FPS: {fps:.2f}",
+                (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
                 2,
             )
 
