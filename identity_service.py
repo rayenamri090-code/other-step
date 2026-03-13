@@ -1,4 +1,7 @@
 import json
+import time
+
+import numpy as np
 
 from database import (
     create_unknown_identity,
@@ -6,13 +9,21 @@ from database import (
     add_alert,
 )
 from config import (
-    UNKNOWN_EMBEDDINGS_TO_SAVE,
     UNKNOWN_STABLE_FRAMES_REQUIRED,
     UNKNOWN_REUSE_THRESHOLD,
     IDENTITY_CONFIRM_FRAMES,
     IDENTITY_LOCK_MIN_SCORE,
     IDENTITY_UNLOCK_STRONGER_SCORE_DIFF,
 )
+
+
+# =========================================================
+# Unknown enrichment tuning
+# These can later be moved to config.py if you want.
+# =========================================================
+UNKNOWN_ENRICH_MAX_EXTRA_EMBEDDINGS_PER_TRACK = 3
+UNKNOWN_ENRICH_COOLDOWN_SEC = 1.5
+UNKNOWN_ENRICH_MIN_DISTANCE = 0.08
 
 
 class IdentityService:
@@ -106,6 +117,64 @@ class IdentityService:
 
         return False
 
+    def _embedding_distance(self, emb1, emb2):
+        if emb1 is None or emb2 is None:
+            return 1.0
+
+        v1 = np.asarray(emb1, dtype=np.float32).flatten()
+        v2 = np.asarray(emb2, dtype=np.float32).flatten()
+
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+
+        if n1 == 0.0 or n2 == 0.0:
+            return 1.0
+
+        sim = float(np.dot(v1, v2) / (n1 * n2))
+        sim = max(-1.0, min(1.0, sim))
+        return 1.0 - sim
+
+    def _maybe_enrich_unknown_identity(self, track, embedding):
+        """
+        Save a few additional varied embeddings for an already confirmed unknown.
+        This improves future reuse stability.
+        """
+        if track.get("identity_type") != "unknown":
+            return False
+
+        person_id = track.get("identity")
+        if not person_id:
+            return False
+
+        saved_count = track.get("unknown_extra_embeddings_saved", 0)
+        if saved_count >= UNKNOWN_ENRICH_MAX_EXTRA_EMBEDDINGS_PER_TRACK:
+            return False
+
+        now_ts = time.time()
+        last_save_ts = track.get("unknown_last_embedding_save_ts", 0.0)
+        if (now_ts - last_save_ts) < UNKNOWN_ENRICH_COOLDOWN_SEC:
+            return False
+
+        last_saved_embedding = track.get("unknown_last_saved_embedding")
+        distance = self._embedding_distance(embedding, last_saved_embedding)
+
+        if last_saved_embedding is not None and distance < UNKNOWN_ENRICH_MIN_DISTANCE:
+            return False
+
+        emb_json = json.dumps(np.asarray(embedding, dtype=float).tolist())
+        confidence = track.get("identity_score")
+        if confidence is None:
+            confidence = 1.0
+
+        add_embedding(person_id, emb_json, float(confidence))
+        self.recognizer.reload_embeddings()
+
+        track["unknown_extra_embeddings_saved"] = saved_count + 1
+        track["unknown_last_embedding_save_ts"] = now_ts
+        track["unknown_last_saved_embedding"] = np.asarray(embedding, dtype=np.float32).copy()
+
+        return True
+
     # =========================================================
     # Main recognition stabilization
     # =========================================================
@@ -130,6 +199,10 @@ class IdentityService:
                     track["identity_lock_score"] = matched_score
                     track["stable_unknown_frames"] = 0
                     self._reset_candidate(track)
+
+                    if matched_type == "unknown":
+                        self._maybe_enrich_unknown_identity(track, embedding)
+
                     return track
 
                 # build contradiction candidate
@@ -157,6 +230,9 @@ class IdentityService:
                     track["identity_locked"] = True
                     track["identity_lock_score"] = matched_score
 
+                if matched_type == "unknown":
+                    self._maybe_enrich_unknown_identity(track, embedding)
+
                 return track
 
             # No confirmed identity yet or new contradiction on unlocked track
@@ -170,6 +246,8 @@ class IdentityService:
                 track["candidate_identity_hits"] = 1
 
             if self._promote_candidate_if_ready(track):
+                if track.get("identity_type") == "unknown":
+                    self._maybe_enrich_unknown_identity(track, embedding)
                 return track
 
             return track
@@ -209,8 +287,6 @@ class IdentityService:
         return None
 
     def convert_unknown_candidate_if_stable(self, track, embedding):
-        # clear runtime flags handled in process_track_identity already
-
         # if already resolved to a proper identity, do nothing
         if track.get("identity") is not None and track.get("identity_type") != "unknown_candidate":
             return None
@@ -227,14 +303,20 @@ class IdentityService:
         if reused is not None:
             self._set_confirmed_identity(track, reused["person_id"], "unknown", reused["score"])
             track["unknown_just_reused"] = True
+
+            track["unknown_created"] = True
+            track["unknown_extra_embeddings_saved"] = 0
+            track["unknown_last_embedding_save_ts"] = time.time()
+            track["unknown_last_saved_embedding"] = np.asarray(embedding, dtype=np.float32).copy()
+
             return reused["person_id"]
 
         person_id = create_unknown_identity()
-        emb_json = json.dumps(embedding.astype(float).tolist())
+        emb_json = json.dumps(np.asarray(embedding, dtype=float).tolist())
 
-        # save several embeddings to make later reuse possible
-        for _ in range(UNKNOWN_EMBEDDINGS_TO_SAVE):
-            add_embedding(person_id, emb_json, 1.0)
+        # Save only ONE real initial embedding.
+        # Extra varied embeddings will be added later while the same track persists.
+        add_embedding(person_id, emb_json, 1.0)
 
         add_alert(
             camera_id=self.camera_id,
@@ -253,5 +335,9 @@ class IdentityService:
         track["pending_alert_sent"] = True
         track["unknown_created"] = True
         track["unknown_just_created"] = True
+
+        track["unknown_extra_embeddings_saved"] = 0
+        track["unknown_last_embedding_save_ts"] = time.time()
+        track["unknown_last_saved_embedding"] = np.asarray(embedding, dtype=np.float32).copy()
 
         return person_id
