@@ -7,14 +7,21 @@ import cv2
 from config import (
     DB_FILE,
     WINDOW_NAME,
+    UNKNOWN_REUSE_THRESHOLD,
 )
 from camera_source import CameraSource
 from detector import FaceDetector
 from recognizer import FaceRecognizer
-from database import ensure_identity, add_embedding
+from database import (
+    ensure_identity,
+    add_embedding,
+    get_identity_info,
+    resolve_unknown_to_existing_identity,
+)
 
 
 CAPTURE_TARGET = 8
+UNKNOWN_SUGGESTION_MIN_SCORE = UNKNOWN_REUSE_THRESHOLD
 
 
 def insert_visitor_profile(
@@ -30,6 +37,7 @@ def insert_visitor_profile(
         person_type="visitor",
         display_name=display_name,
         status="active",
+        is_active=1,
     )
 
     conn = sqlite3.connect(DB_FILE)
@@ -68,10 +76,66 @@ def draw_status(frame, text, y=30, color=(0, 255, 0)):
     )
 
 
+def ask_yes_no(prompt: str) -> bool:
+    value = input(prompt).strip().lower()
+    return value in ("y", "yes", "1", "true")
+
+
+def suggest_unknown_matches(recognizer: FaceRecognizer, embedding, min_score=UNKNOWN_SUGGESTION_MIN_SCORE, top_k=5):
+    candidates = recognizer.recognize_top_k(embedding, k=top_k)
+    filtered = []
+
+    for item in candidates:
+        if item["person_type"] != "unknown":
+            continue
+        if item["score"] < min_score:
+            continue
+
+        info = get_identity_info(item["person_id"])
+        if info is None:
+            continue
+        if info["status"] in ("blocked", "merged", "inactive"):
+            continue
+
+        filtered.append(item)
+
+    return filtered
+
+
+def choose_unknown_candidate(candidates):
+    if not candidates:
+        return None
+
+    print("\n[INFO] Potential unknown matches found:")
+    for idx, item in enumerate(candidates, start=1):
+        print(f"  {idx}) {item['person_id']}  score={item['score']:.3f}")
+
+    print("  0) None of these, continue as new visitor")
+
+    while True:
+        raw = input("Choose candidate number: ").strip()
+        if raw == "":
+            return None
+
+        try:
+            choice = int(raw)
+        except ValueError:
+            print("Invalid choice.")
+            continue
+
+        if choice == 0:
+            return None
+
+        if 1 <= choice <= len(candidates):
+            return candidates[choice - 1]["person_id"]
+
+        print("Choice out of range.")
+
+
 def main():
     print("\n=== Visitor Enrollment ===\n")
 
-    person_id = input("Visitor person_id (example vis_001): ").strip()
+    person_id = input("Visitor person_id (example visitor_001): ").strip()
     display_name = input("Display name: ").strip()
     host_person_id = input("Host person_id (example emp_001): ").strip()
     visit_reason = input("Visit reason: ").strip()
@@ -93,6 +157,12 @@ def main():
         print("Invalid datetime format. Use YYYY-MM-DD HH:MM:SS")
         return
 
+    existing_target_info = get_identity_info(person_id)
+    if existing_target_info is not None and existing_target_info["person_type"] != "visitor":
+        print(f"[ERROR] person_id '{person_id}' already exists but is not a visitor.")
+        return
+
+    # Create/update visitor profile BEFORE camera flow.
     insert_visitor_profile(
         person_id=person_id,
         display_name=display_name or person_id,
@@ -104,6 +174,7 @@ def main():
 
     print(f"\n[INFO] Visitor profile saved for {person_id}")
     print("[INFO] Camera will open now")
+    print("[INFO] Press S to scan unknown suggestions from current face")
     print("[INFO] Press C to capture a sample")
     print("[INFO] Press Q to quit")
     print(f"[INFO] Need {CAPTURE_TARGET} good samples\n")
@@ -113,6 +184,8 @@ def main():
     recognizer = FaceRecognizer()
 
     saved_count = 0
+    resolved_unknown_id = None
+    merge_done = False
 
     try:
         camera.open()
@@ -136,14 +209,24 @@ def main():
 
             draw_status(display, f"Enroll visitor: {person_id}", y=30)
             draw_status(display, f"Saved samples: {saved_count}/{CAPTURE_TARGET}", y=60, color=(255, 255, 0))
-            draw_status(display, "Press C to capture | Press Q to quit", y=90, color=(200, 200, 200))
+            draw_status(display, "Press S suggest | C capture | Q quit", y=90, color=(200, 200, 200))
+
+            if resolved_unknown_id:
+                merge_color = (0, 255, 0) if merge_done else (0, 255, 255)
+                merge_text = f"Resolved from: {resolved_unknown_id}"
+                if merge_done:
+                    merge_text += " [MERGED]"
+                draw_status(display, merge_text, y=120, color=merge_color)
+                face_status_y = 150
+            else:
+                face_status_y = 120
 
             if best_det is not None:
                 x, y, w, h = best_det["bbox"]
                 cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                draw_status(display, "Face detected", y=120, color=(0, 255, 0))
+                draw_status(display, "Face detected", y=face_status_y, color=(0, 255, 0))
             else:
-                draw_status(display, "No face detected", y=120, color=(0, 0, 255))
+                draw_status(display, "No face detected", y=face_status_y, color=(0, 0, 255))
 
             cv2.imshow(f"{WINDOW_NAME} - Visitor Enrollment", display)
 
@@ -151,6 +234,53 @@ def main():
 
             if key in (ord("q"), ord("Q")):
                 break
+
+            if key in (ord("s"), ord("S")):
+                if best_det is None:
+                    print("[WARN] No face detected. Cannot scan suggestions.")
+                    continue
+
+                try:
+                    embedding = recognizer.extract_embedding(frame, best_det["face_row"])
+                except Exception as e:
+                    print(f"[WARN] Failed to extract embedding: {e}")
+                    continue
+
+                candidates = suggest_unknown_matches(recognizer, embedding)
+                chosen_unknown_id = choose_unknown_candidate(candidates)
+
+                if not chosen_unknown_id:
+                    print("[INFO] No unknown candidate selected. Will continue as fresh visitor.")
+                    continue
+
+                if merge_done and resolved_unknown_id == chosen_unknown_id:
+                    print(f"[INFO] Already merged from {chosen_unknown_id}.")
+                    continue
+
+                should_merge_history = ask_yes_no(
+                    "Reassign old unknown history to this visitor? [y/N]: "
+                )
+
+                note = f"Resolved {chosen_unknown_id} into visitor {person_id}"
+
+                try:
+                    result = resolve_unknown_to_existing_identity(
+                        unknown_person_id=chosen_unknown_id,
+                        target_person_id=person_id,
+                        note=note,
+                        copy_embeddings=True,
+                        reassign_history=should_merge_history,
+                    )
+                    recognizer.reload_embeddings()
+
+                    resolved_unknown_id = chosen_unknown_id
+                    merge_done = True
+
+                    print(f"[OK] Unknown resolved immediately into visitor: {result}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to resolve unknown immediately: {e}")
+
+                continue
 
             if key in (ord("c"), ord("C")):
                 if best_det is None:

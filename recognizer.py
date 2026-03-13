@@ -50,7 +50,7 @@ class FaceRecognizer:
         rows = get_all_identities_with_embeddings()
 
         for person_id, person_type, status, emb_json in rows:
-            if status == "blocked":
+            if status in ("blocked", "merged", "inactive"):
                 continue
 
             try:

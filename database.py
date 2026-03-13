@@ -36,6 +36,24 @@ def get_conn():
 
 
 # =========================================================
+# Schema / Migration Helpers
+# =========================================================
+
+def _column_exists(conn, table_name: str, column_name: str) -> bool:
+    c = conn.cursor()
+    c.execute(f"PRAGMA table_info({table_name})")
+    rows = c.fetchall()
+    return any(row["name"] == column_name for row in rows)
+
+
+def _ensure_column(conn, table_name: str, column_name: str, column_sql: str):
+    if not _column_exists(conn, table_name, column_name):
+        c = conn.cursor()
+        c.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+        conn.commit()
+
+
+# =========================================================
 # Database Initialization
 # =========================================================
 
@@ -188,6 +206,14 @@ def init_db():
     )
     """)
 
+    # -----------------------------------------------------
+    # Migration-safe extra columns for future Odoo workflow
+    # -----------------------------------------------------
+    _ensure_column(conn, "identities", "is_active", "INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(conn, "identities", "merged_into_person_id", "TEXT")
+    _ensure_column(conn, "identities", "resolved_at", "TEXT")
+    _ensure_column(conn, "identities", "resolution_note", "TEXT")
+
     c.execute("""
     INSERT OR IGNORE INTO camera_zones (
         zone_id, camera_id, zone_name, zone_type, is_access_point, is_active, created_at
@@ -244,7 +270,13 @@ def get_camera_zone(camera_id: str):
 # Identity Helpers
 # =========================================================
 
-def ensure_identity(person_id: str, person_type: str, display_name: str | None = None, status: str = "active"):
+def ensure_identity(
+    person_id: str,
+    person_type: str,
+    display_name: str | None = None,
+    status: str = "active",
+    is_active: int = 1,
+):
     conn = get_conn()
     c = conn.cursor()
     now = now_str()
@@ -254,15 +286,22 @@ def ensure_identity(person_id: str, person_type: str, display_name: str | None =
 
     if row is None:
         c.execute("""
-        INSERT INTO identities (person_id, person_type, display_name, status, created_at, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, (person_id, person_type, display_name, status, now, now))
+        INSERT INTO identities (
+            person_id, person_type, display_name, status, created_at, last_seen,
+            is_active, merged_into_person_id, resolved_at, resolution_note
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+        """, (person_id, person_type, display_name, status, now, now, is_active))
     else:
         c.execute("""
         UPDATE identities
-        SET person_type = ?, display_name = COALESCE(?, display_name), status = ?, last_seen = ?
+        SET person_type = ?,
+            display_name = COALESCE(?, display_name),
+            status = ?,
+            last_seen = ?,
+            is_active = ?
         WHERE person_id = ?
-        """, (person_type, display_name, status, now, person_id))
+        """, (person_type, display_name, status, now, is_active, person_id))
 
     conn.commit()
     conn.close()
@@ -284,7 +323,9 @@ def get_identity_info(person_id: str):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-    SELECT person_id, person_type, display_name, status
+    SELECT person_id, person_type, display_name, status,
+           COALESCE(is_active, 1) AS is_active,
+           merged_into_person_id, resolved_at, resolution_note
     FROM identities
     WHERE person_id = ?
     """, (person_id,))
@@ -299,6 +340,10 @@ def get_identity_info(person_id: str):
         "person_type": row["person_type"],
         "display_name": row["display_name"],
         "status": row["status"],
+        "is_active": int(row["is_active"]),
+        "merged_into_person_id": row["merged_into_person_id"],
+        "resolved_at": row["resolved_at"],
+        "resolution_note": row["resolution_note"],
     }
 
 
@@ -306,7 +351,9 @@ def get_all_identities():
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-    SELECT person_id, person_type, display_name, status
+    SELECT person_id, person_type, display_name, status,
+           COALESCE(is_active, 1) AS is_active,
+           merged_into_person_id, resolved_at, resolution_note
     FROM identities
     ORDER BY person_type ASC, person_id ASC
     """)
@@ -319,6 +366,10 @@ def get_all_identities():
             "person_type": row["person_type"],
             "display_name": row["display_name"],
             "status": row["status"],
+            "is_active": int(row["is_active"]),
+            "merged_into_person_id": row["merged_into_person_id"],
+            "resolved_at": row["resolved_at"],
+            "resolution_note": row["resolution_note"],
         }
         for row in rows
     ]
@@ -353,8 +404,109 @@ def create_unknown_identity() -> str:
         person_type="unknown",
         display_name=person_id,
         status="pending_validation",
+        is_active=1,
     )
     return person_id
+
+
+def create_employee_identity(
+    display_name: str,
+    employee_code: str | None = None,
+    department: str | None = None,
+    role_name: str | None = None,
+    schedule_id: str | None = None,
+    person_id: str | None = None,
+) -> str:
+    if not person_id:
+        person_id = next_person_id("emp_", "employee")
+
+    ensure_identity(
+        person_id=person_id,
+        person_type="employee",
+        display_name=display_name,
+        status="active",
+        is_active=1,
+    )
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    INSERT OR REPLACE INTO employees (
+        person_id, employee_code, department, role_name, schedule_id
+    )
+    VALUES (?, ?, ?, ?, ?)
+    """, (person_id, employee_code, department, role_name, schedule_id))
+    conn.commit()
+    conn.close()
+
+    return person_id
+
+
+def create_visitor_identity(
+    display_name: str,
+    host_person_id: str | None = None,
+    visit_reason: str | None = None,
+    valid_from: str | None = None,
+    valid_to: str | None = None,
+    person_id: str | None = None,
+) -> str:
+    if not person_id:
+        person_id = next_person_id("visitor_", "visitor")
+
+    ensure_identity(
+        person_id=person_id,
+        person_type="visitor",
+        display_name=display_name,
+        status="active",
+        is_active=1,
+    )
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    INSERT OR REPLACE INTO visitors (
+        person_id, host_person_id, visit_reason, valid_from, valid_to
+    )
+    VALUES (?, ?, ?, ?, ?)
+    """, (person_id, host_person_id, visit_reason, valid_from, valid_to))
+    conn.commit()
+    conn.close()
+
+    return person_id
+
+
+def set_identity_blocked(person_id: str, note: str = ""):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    UPDATE identities
+    SET status = 'blocked',
+        is_active = 0,
+        resolved_at = ?,
+        resolution_note = CASE
+            WHEN ? = '' THEN resolution_note
+            ELSE ?
+        END
+    WHERE person_id = ?
+    """, (now_str(), note, note, person_id))
+    conn.commit()
+    conn.close()
+
+
+def set_identity_merged(source_person_id: str, target_person_id: str, note: str = ""):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    UPDATE identities
+    SET status = 'merged',
+        is_active = 0,
+        merged_into_person_id = ?,
+        resolved_at = ?,
+        resolution_note = ?
+    WHERE person_id = ?
+    """, (target_person_id, now_str(), note, source_person_id))
+    conn.commit()
+    conn.close()
 
 
 # =========================================================
@@ -372,6 +524,33 @@ def add_embedding(person_id: str, embedding_json: str, quality_score: float = 1.
     conn.close()
 
 
+def copy_embeddings_to_identity(source_person_id: str, target_person_id: str):
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("""
+    SELECT embedding_json, quality_score
+    FROM face_embeddings
+    WHERE person_id = ?
+    ORDER BY id ASC
+    """, (source_person_id,))
+    rows = c.fetchall()
+
+    for row in rows:
+        c.execute("""
+        INSERT INTO face_embeddings (person_id, embedding_json, quality_score, created_at)
+        VALUES (?, ?, ?, ?)
+        """, (
+            target_person_id,
+            row["embedding_json"],
+            row["quality_score"],
+            now_str(),
+        ))
+
+    conn.commit()
+    conn.close()
+
+
 def get_all_identities_with_embeddings():
     conn = get_conn()
     c = conn.cursor()
@@ -379,6 +558,8 @@ def get_all_identities_with_embeddings():
     SELECT i.person_id, i.person_type, i.status, fe.embedding_json
     FROM identities i
     JOIN face_embeddings fe ON fe.person_id = i.person_id
+    WHERE COALESCE(i.is_active, 1) = 1
+      AND i.status NOT IN ('blocked', 'merged')
     """)
     rows = c.fetchall()
     conn.close()
@@ -392,6 +573,154 @@ def get_all_identities_with_embeddings():
         )
         for row in rows
     ]
+
+
+# =========================================================
+# Resolution / Merge Helpers
+# =========================================================
+
+def reassign_history_to_identity(source_person_id: str, target_person_id: str, target_person_type: str):
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("""
+    UPDATE visible_sessions
+    SET person_id = ?, person_type = ?
+    WHERE person_id = ?
+    """, (target_person_id, target_person_type, source_person_id))
+
+    c.execute("""
+    UPDATE access_sessions
+    SET person_id = ?, person_type = ?
+    WHERE person_id = ?
+    """, (target_person_id, target_person_type, source_person_id))
+
+    c.execute("""
+    UPDATE access_events
+    SET person_id = ?, person_type = ?
+    WHERE person_id = ?
+    """, (target_person_id, target_person_type, source_person_id))
+
+    c.execute("""
+    UPDATE alerts
+    SET person_id = ?, person_type = ?
+    WHERE person_id = ?
+    """, (target_person_id, target_person_type, source_person_id))
+
+    c.execute("""
+    UPDATE system_events
+    SET person_id = ?, person_type = ?
+    WHERE person_id = ?
+    """, (target_person_id, target_person_type, source_person_id))
+
+    conn.commit()
+    conn.close()
+
+
+def resolve_unknown_to_existing_identity(
+    unknown_person_id: str,
+    target_person_id: str,
+    note: str = "",
+    copy_embeddings: bool = True,
+    reassign_history: bool = True,
+):
+    unknown_info = get_identity_info(unknown_person_id)
+    target_info = get_identity_info(target_person_id)
+
+    if unknown_info is None:
+        raise ValueError(f"Unknown source identity not found: {unknown_person_id}")
+
+    if target_info is None:
+        raise ValueError(f"Target identity not found: {target_person_id}")
+
+    if unknown_info["person_type"] != "unknown":
+        raise ValueError(f"Source identity is not an unknown: {unknown_person_id}")
+
+    if unknown_person_id == target_person_id:
+        raise ValueError("Source and target identities cannot be the same")
+
+    if copy_embeddings:
+        copy_embeddings_to_identity(unknown_person_id, target_person_id)
+
+    if reassign_history:
+        reassign_history_to_identity(
+            source_person_id=unknown_person_id,
+            target_person_id=target_person_id,
+            target_person_type=target_info["person_type"],
+        )
+
+    set_identity_merged(
+        source_person_id=unknown_person_id,
+        target_person_id=target_person_id,
+        note=note or f"Resolved into {target_person_id}",
+    )
+
+    return {
+        "source_person_id": unknown_person_id,
+        "target_person_id": target_person_id,
+        "target_person_type": target_info["person_type"],
+        "copied_embeddings": copy_embeddings,
+        "reassigned_history": reassign_history,
+        "status": "merged",
+    }
+
+
+def resolve_unknown_to_new_employee(
+    unknown_person_id: str,
+    display_name: str,
+    employee_code: str | None = None,
+    department: str | None = None,
+    role_name: str | None = None,
+    schedule_id: str | None = None,
+    note: str = "",
+    reassign_history: bool = True,
+):
+    target_person_id = create_employee_identity(
+        display_name=display_name,
+        employee_code=employee_code,
+        department=department,
+        role_name=role_name,
+        schedule_id=schedule_id,
+    )
+
+    result = resolve_unknown_to_existing_identity(
+        unknown_person_id=unknown_person_id,
+        target_person_id=target_person_id,
+        note=note or f"Resolved unknown as new employee {target_person_id}",
+        copy_embeddings=True,
+        reassign_history=reassign_history,
+    )
+
+    return result
+
+
+def resolve_unknown_to_new_visitor(
+    unknown_person_id: str,
+    display_name: str,
+    host_person_id: str | None = None,
+    visit_reason: str | None = None,
+    valid_from: str | None = None,
+    valid_to: str | None = None,
+    note: str = "",
+    reassign_history: bool = True,
+):
+    target_person_id = create_visitor_identity(
+        display_name=display_name,
+        host_person_id=host_person_id,
+        visit_reason=visit_reason,
+        valid_from=valid_from,
+        valid_to=valid_to,
+    )
+
+    result = resolve_unknown_to_existing_identity(
+        unknown_person_id=unknown_person_id,
+        target_person_id=target_person_id,
+        note=note or f"Resolved unknown as new visitor {target_person_id}",
+        copy_embeddings=True,
+        reassign_history=reassign_history,
+    )
+
+    return result
 
 
 # =========================================================
@@ -573,7 +902,7 @@ def create_demo_seed():
     count = c.fetchone()["cnt"]
 
     if count == 0:
-        ensure_identity("emp_001", "employee", "Employee 001", "active")
+        ensure_identity("emp_001", "employee", "Employee 001", "active", 1)
 
         c.execute("""
         INSERT OR IGNORE INTO employees (person_id, employee_code, department, role_name, schedule_id)
