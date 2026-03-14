@@ -1,5 +1,8 @@
+from pathlib import Path
+
 import cv2
 import numpy as np
+import onnxruntime as ort
 import torch
 import torch.nn.functional as F
 from torchvision import models, transforms
@@ -13,10 +16,17 @@ class AttributeService:
     Not for authentication.
     Not for authorization.
 
-    FairFace-based age + gender prediction.
+    Supports:
+    - FairFace age + gender prediction
+    - ONNX emotion prediction
+
+    Important:
+    - identity/auth/access decisions must NOT depend on these outputs
+    - caller decides stability voting / locking / DB persistence
     """
 
     GENDER_LABELS = ["male", "female"]
+
     AGE_LABELS = [
         "0-2",
         "3-9",
@@ -29,7 +39,22 @@ class AttributeService:
         "70+",
     ]
 
+    # enet_b0_8_best_afew
+    EMOTION_LABELS = [
+        "angry",
+        "contempt",
+        "disgust",
+        "fear",
+        "happy",
+        "neutral",
+        "sad",
+        "surprised",
+    ]
+
     def __init__(self):
+        # -----------------------------
+        # FairFace age/gender
+        # -----------------------------
         self.gender_enabled = False
         self.age_enabled = False
         self.model = None
@@ -69,13 +94,59 @@ class AttributeService:
         else:
             print("[ATTR] FairFace model file not found, age/gender prediction disabled")
 
+        # -----------------------------
+        # Emotion ONNX
+        # -----------------------------
+        self.emotion_enabled = False
+        self.emotion_session = None
+        self.emotion_input_name = None
+        self.emotion_output_name = None
+
+        self.emotion_model_path = MODELS_DIR / "emotion" / "enet_b0_8_best_afew.onnx"
+
+        if self.emotion_model_path.exists():
+            try:
+                providers = ["CPUExecutionProvider"]
+                self.emotion_session = ort.InferenceSession(
+                    str(self.emotion_model_path),
+                    providers=providers,
+                )
+
+                self.emotion_input_name = self.emotion_session.get_inputs()[0].name
+                self.emotion_output_name = self.emotion_session.get_outputs()[0].name
+
+                self.emotion_enabled = True
+                print("[ATTR] Emotion ONNX model loaded")
+            except Exception as e:
+                self.emotion_enabled = False
+                self.emotion_session = None
+                print(f"[ATTR] Emotion model load failed: {e}")
+        else:
+            print("[ATTR] Emotion model file not found, emotion prediction disabled")
+
+    # =========================================================
+    # Empty Results
+    # =========================================================
+
     def _empty_result(self):
         return {
             "gender_prediction": None,
             "gender_confidence": None,
             "age_prediction": None,
             "age_confidence": None,
+            "emotion_prediction": None,
+            "emotion_confidence": None,
         }
+
+    def _empty_emotion_result(self):
+        return {
+            "emotion_prediction": None,
+            "emotion_confidence": None,
+        }
+
+    # =========================================================
+    # Face Crop Helpers
+    # =========================================================
 
     def _safe_crop_face(self, frame, bbox, pad_ratio=0.22):
         if frame is None or frame.size == 0:
@@ -132,6 +203,10 @@ class AttributeService:
 
         return True
 
+    # =========================================================
+    # FairFace Helpers
+    # =========================================================
+
     def _prepare_tensor(self, face_crop):
         if face_crop is None or face_crop.size == 0:
             return None
@@ -139,6 +214,32 @@ class AttributeService:
         rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
         tensor = self.transform(rgb).unsqueeze(0).to(self.device)
         return tensor
+
+    # =========================================================
+    # Emotion Helpers
+    # =========================================================
+
+    def _prepare_emotion_input(self, face_crop):
+        """
+        Preprocess for enet_b0_8_best_afew ONNX model.
+        Shape: (1, 3, 224, 224), float32, normalized to ImageNet stats.
+        """
+        rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_LINEAR)
+        img = resized.astype(np.float32) / 255.0
+
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+        img = (img - mean) / std
+        img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
+        img = np.expand_dims(img, axis=0).astype(np.float32)
+
+        return img
+
+    # =========================================================
+    # Main Predictions
+    # =========================================================
 
     def predict_attributes(self, frame, bbox):
         """
@@ -148,73 +249,114 @@ class AttributeService:
             "gender_confidence": float | None,
             "age_prediction": str | None,
             "age_confidence": float | None,
+            "emotion_prediction": str | None,
+            "emotion_confidence": float | None,
         }
 
         Important:
         - gender_prediction is filtered by confidence threshold
-        - age_prediction is always returned when inference succeeds
+        - age_prediction is returned when inference succeeds
+        - emotion_prediction is returned when inference succeeds
         - caller decides stability and DB locking
         """
-        if self.model is None:
-            return self._empty_result()
+        result = self._empty_result()
 
         face_crop = self._safe_crop_face(frame, bbox)
         if face_crop is None:
-            return self._empty_result()
+            return result
 
         if not self._is_crop_quality_good_enough(face_crop):
-            return self._empty_result()
+            return result
 
-        try:
-            tensor = self._prepare_tensor(face_crop)
-            if tensor is None:
-                return self._empty_result()
+        # -----------------------------
+        # FairFace age/gender
+        # -----------------------------
+        if self.model is not None:
+            try:
+                tensor = self._prepare_tensor(face_crop)
+                if tensor is not None:
+                    with torch.no_grad():
+                        logits = self.model(tensor).squeeze(0)
 
-            with torch.no_grad():
-                logits = self.model(tensor).squeeze(0)
+                    # FairFace flattened output layout:
+                    # race   = logits[0:7]
+                    # gender = logits[7:9]
+                    # age    = logits[9:18]
+                    gender_logits = logits[7:9]
+                    age_logits = logits[9:18]
 
-            # FairFace flattened output layout:
-            # race   = logits[0:7]
-            # gender = logits[7:9]
-            # age    = logits[9:18]
-            gender_logits = logits[7:9]
-            age_logits = logits[9:18]
+                    if len(self.GENDER_LABELS) != len(gender_logits):
+                        raise ValueError(
+                            f"GENDER_LABELS has {len(self.GENDER_LABELS)} labels but model returned {len(gender_logits)} gender logits"
+                        )
 
-            if len(self.GENDER_LABELS) != len(gender_logits):
-                raise ValueError(
-                    f"GENDER_LABELS has {len(self.GENDER_LABELS)} labels but model returned {len(gender_logits)} gender logits"
+                    if len(self.AGE_LABELS) != len(age_logits):
+                        raise ValueError(
+                            f"AGE_LABELS has {len(self.AGE_LABELS)} labels but model returned {len(age_logits)} age logits"
+                        )
+
+                    gender_probs = F.softmax(gender_logits, dim=0).detach().cpu().numpy()
+                    age_probs = F.softmax(age_logits, dim=0).detach().cpu().numpy()
+
+                    gender_idx = int(np.argmax(gender_probs))
+                    age_idx = int(np.argmax(age_probs))
+
+                    gender_conf = float(gender_probs[gender_idx])
+                    age_conf = float(age_probs[age_idx])
+
+                    gender_prediction = None
+                    if gender_conf >= self.gender_confidence_min:
+                        gender_prediction = self.GENDER_LABELS[gender_idx]
+
+                    age_prediction = self.AGE_LABELS[age_idx]
+
+                    result["gender_prediction"] = gender_prediction
+                    result["gender_confidence"] = gender_conf
+                    result["age_prediction"] = age_prediction
+                    result["age_confidence"] = age_conf
+
+            except Exception as e:
+                print(f"[ATTR] Age/gender prediction failed: {e}")
+
+        # -----------------------------
+        # Emotion ONNX
+        # -----------------------------
+        if self.emotion_enabled and self.emotion_session is not None:
+            try:
+                emotion_input = self._prepare_emotion_input(face_crop)
+                outputs = self.emotion_session.run(
+                    [self.emotion_output_name],
+                    {self.emotion_input_name: emotion_input},
                 )
 
-            if len(self.AGE_LABELS) != len(age_logits):
-                raise ValueError(
-                    f"AGE_LABELS has {len(self.AGE_LABELS)} labels but model returned {len(age_logits)} age logits"
-                )
+                logits = outputs[0]
+                logits = np.array(logits).squeeze()
 
-            gender_probs = F.softmax(gender_logits, dim=0).detach().cpu().numpy()
-            age_probs = F.softmax(age_logits, dim=0).detach().cpu().numpy()
+                if logits.ndim != 1:
+                    raise ValueError(f"Unexpected emotion logits shape: {logits.shape}")
 
-            gender_idx = int(np.argmax(gender_probs))
-            age_idx = int(np.argmax(age_probs))
+                exp_logits = np.exp(logits - np.max(logits))
+                probs = exp_logits / np.sum(exp_logits)
 
-            gender_conf = float(gender_probs[gender_idx])
-            age_conf = float(age_probs[age_idx])
+                emotion_idx = int(np.argmax(probs))
+                emotion_conf = float(probs[emotion_idx])
 
-            gender_prediction = None
-            if gender_conf >= self.gender_confidence_min:
-                gender_prediction = self.GENDER_LABELS[gender_idx]
+                if emotion_idx < 0 or emotion_idx >= len(self.EMOTION_LABELS):
+                    raise ValueError(f"Emotion index out of range: {emotion_idx}")
 
-            age_prediction = self.AGE_LABELS[age_idx]
+                emotion_prediction = self.EMOTION_LABELS[emotion_idx]
 
-            return {
-                "gender_prediction": gender_prediction,
-                "gender_confidence": gender_conf,
-                "age_prediction": age_prediction,
-                "age_confidence": age_conf,
-            }
+                result["emotion_prediction"] = emotion_prediction
+                result["emotion_confidence"] = emotion_conf
 
-        except Exception as e:
-            print(f"[ATTR] Prediction failed: {e}")
-            return self._empty_result()
+            except Exception as e:
+                print(f"[ATTR] Emotion prediction failed: {e}")
+
+        return result
+
+    # =========================================================
+    # Convenience Methods
+    # =========================================================
 
     def predict_gender(self, frame, bbox):
         result = self.predict_attributes(frame, bbox)
@@ -228,4 +370,11 @@ class AttributeService:
         return {
             "age_prediction": result.get("age_prediction"),
             "age_confidence": result.get("age_confidence"),
+        }
+
+    def predict_emotion(self, frame, bbox):
+        result = self.predict_attributes(frame, bbox)
+        return {
+            "emotion_prediction": result.get("emotion_prediction"),
+            "emotion_confidence": result.get("emotion_confidence"),
         }

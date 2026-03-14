@@ -102,6 +102,26 @@ def _ensure_indexes(conn):
     ON identities(attributes_locked)
     """)
 
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_emotion_samples_person_time
+    ON emotion_samples(person_id, timestamp)
+    """)
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_emotion_samples_person_emotion
+    ON emotion_samples(person_id, emotion)
+    """)
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_emotion_session_stats_person_time
+    ON emotion_session_stats(person_id, session_start_time)
+    """)
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_emotion_session_stats_person_emotion
+    ON emotion_session_stats(person_id, emotion)
+    """)
+
     conn.commit()
 
 
@@ -267,6 +287,38 @@ def init_db():
         person_type TEXT,
         confidence REAL,
         payload_json TEXT
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS emotion_samples (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        camera_id TEXT NOT NULL,
+        zone_id TEXT,
+        track_id TEXT,
+        person_id TEXT NOT NULL,
+        person_type TEXT,
+        emotion TEXT NOT NULL,
+        confidence REAL,
+        FOREIGN KEY (person_id) REFERENCES identities(person_id)
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS emotion_session_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        person_id TEXT NOT NULL,
+        person_type TEXT,
+        camera_id TEXT NOT NULL,
+        zone_id TEXT,
+        track_id TEXT,
+        session_start_time TEXT,
+        session_end_time TEXT,
+        emotion TEXT NOT NULL,
+        duration_seconds REAL NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (person_id) REFERENCES identities(person_id)
     )
     """)
 
@@ -899,6 +951,18 @@ def reassign_history_to_identity(source_person_id: str, target_person_id: str, t
     WHERE person_id = ?
     """, (target_person_id, target_person_type, source_person_id))
 
+    c.execute("""
+    UPDATE emotion_samples
+    SET person_id = ?, person_type = ?
+    WHERE person_id = ?
+    """, (target_person_id, target_person_type, source_person_id))
+
+    c.execute("""
+    UPDATE emotion_session_stats
+    SET person_id = ?, person_type = ?
+    WHERE person_id = ?
+    """, (target_person_id, target_person_type, source_person_id))
+
     conn.commit()
     conn.close()
 
@@ -1082,6 +1146,72 @@ def add_system_event(
         person_type,
         confidence,
         payload_json,
+    ))
+    conn.commit()
+    conn.close()
+
+
+def add_emotion_sample(
+    camera_id: str,
+    person_id: str,
+    emotion: str,
+    confidence: float | None = None,
+    zone_id: str | None = None,
+    track_id: str | None = None,
+    person_type: str | None = None,
+):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    INSERT INTO emotion_samples (
+        timestamp, camera_id, zone_id, track_id, person_id, person_type, emotion, confidence
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        now_str(),
+        camera_id,
+        zone_id,
+        track_id,
+        person_id,
+        person_type,
+        emotion,
+        confidence,
+    ))
+    conn.commit()
+    conn.close()
+
+
+def add_emotion_session_stat(
+    person_id: str,
+    emotion: str,
+    duration_seconds: float,
+    camera_id: str,
+    zone_id: str | None = None,
+    track_id: str | None = None,
+    person_type: str | None = None,
+    session_start_time: str | None = None,
+    session_end_time: str | None = None,
+):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    INSERT INTO emotion_session_stats (
+        person_id, person_type, camera_id, zone_id, track_id,
+        session_start_time, session_end_time,
+        emotion, duration_seconds, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        person_id,
+        person_type,
+        camera_id,
+        zone_id,
+        track_id,
+        session_start_time,
+        session_end_time,
+        emotion,
+        float(duration_seconds),
+        now_str(),
     ))
     conn.commit()
     conn.close()
@@ -1479,6 +1609,163 @@ def get_all_daily_work_hours(date_str: str):
         }
         for row in rows
     ]
+
+
+def get_person_emotion_distribution(person_id: str, date_str: str | None = None):
+    conn = get_conn()
+    c = conn.cursor()
+
+    if date_str:
+        c.execute("""
+        SELECT emotion, COUNT(*) AS sample_count
+        FROM emotion_samples
+        WHERE person_id = ?
+          AND date(timestamp) = ?
+        GROUP BY emotion
+        ORDER BY sample_count DESC, emotion ASC
+        """, (person_id, date_str))
+    else:
+        c.execute("""
+        SELECT emotion, COUNT(*) AS sample_count
+        FROM emotion_samples
+        WHERE person_id = ?
+        GROUP BY emotion
+        ORDER BY sample_count DESC, emotion ASC
+        """, (person_id,))
+
+    rows = c.fetchall()
+
+    if date_str:
+        c.execute("""
+        SELECT COUNT(*) AS total_count
+        FROM emotion_samples
+        WHERE person_id = ?
+          AND date(timestamp) = ?
+        """, (person_id, date_str))
+    else:
+        c.execute("""
+        SELECT COUNT(*) AS total_count
+        FROM emotion_samples
+        WHERE person_id = ?
+        """, (person_id,))
+
+    total_count = int(c.fetchone()["total_count"] or 0)
+    conn.close()
+
+    distribution = []
+    for row in rows:
+        count = int(row["sample_count"])
+        percentage = round((count / total_count) * 100.0, 2) if total_count > 0 else 0.0
+        distribution.append({
+            "emotion": row["emotion"],
+            "sample_count": count,
+            "percentage": percentage,
+        })
+
+    return {
+        "person_id": person_id,
+        "date": date_str,
+        "total_samples": total_count,
+        "distribution": distribution,
+    }
+
+
+def get_all_emotion_distributions(date_str: str | None = None):
+    conn = get_conn()
+    c = conn.cursor()
+
+    if date_str:
+        c.execute("""
+        SELECT person_id, person_type, emotion, COUNT(*) AS sample_count
+        FROM emotion_samples
+        WHERE date(timestamp) = ?
+        GROUP BY person_id, person_type, emotion
+        ORDER BY person_id ASC, sample_count DESC, emotion ASC
+        """, (date_str,))
+    else:
+        c.execute("""
+        SELECT person_id, person_type, emotion, COUNT(*) AS sample_count
+        FROM emotion_samples
+        GROUP BY person_id, person_type, emotion
+        ORDER BY person_id ASC, sample_count DESC, emotion ASC
+        """)
+
+    rows = c.fetchall()
+    conn.close()
+
+    grouped = {}
+
+    for row in rows:
+        person_id = row["person_id"]
+        person_type = row["person_type"]
+        emotion = row["emotion"]
+        count = int(row["sample_count"])
+
+        if person_id not in grouped:
+            grouped[person_id] = {
+                "person_id": person_id,
+                "person_type": person_type,
+                "total_samples": 0,
+                "distribution": [],
+            }
+
+        grouped[person_id]["distribution"].append({
+            "emotion": emotion,
+            "sample_count": count,
+        })
+        grouped[person_id]["total_samples"] += count
+
+    for item in grouped.values():
+        total = item["total_samples"]
+        for emo in item["distribution"]:
+            emo["percentage"] = round((emo["sample_count"] / total) * 100.0, 2) if total > 0 else 0.0
+
+    return sorted(grouped.values(), key=lambda x: x["person_id"])
+
+
+def get_person_emotion_time_distribution(person_id: str, date_str: str | None = None):
+    conn = get_conn()
+    c = conn.cursor()
+
+    if date_str:
+        c.execute("""
+        SELECT emotion, COALESCE(SUM(duration_seconds), 0) AS total_duration
+        FROM emotion_session_stats
+        WHERE person_id = ?
+          AND date(created_at) = ?
+        GROUP BY emotion
+        ORDER BY total_duration DESC, emotion ASC
+        """, (person_id, date_str))
+    else:
+        c.execute("""
+        SELECT emotion, COALESCE(SUM(duration_seconds), 0) AS total_duration
+        FROM emotion_session_stats
+        WHERE person_id = ?
+        GROUP BY emotion
+        ORDER BY total_duration DESC, emotion ASC
+        """, (person_id,))
+
+    rows = c.fetchall()
+    conn.close()
+
+    total = sum(float(r["total_duration"] or 0.0) for r in rows)
+
+    distribution = []
+    for row in rows:
+        dur = float(row["total_duration"] or 0.0)
+        pct = round((dur / total) * 100.0, 2) if total > 0 else 0.0
+        distribution.append({
+            "emotion": row["emotion"],
+            "duration_seconds": dur,
+            "percentage": pct,
+        })
+
+    return {
+        "person_id": person_id,
+        "date": date_str,
+        "total_duration_seconds": total,
+        "distribution": distribution,
+    }
 
 
 def get_grouped_daily_report(date_str: str):

@@ -29,6 +29,10 @@ from database import (
     get_identity_attributes,
     save_identity_attributes,
     get_identity_info,
+    add_emotion_sample,
+    add_emotion_session_stat,
+    get_person_emotion_distribution,
+    get_person_emotion_time_distribution,
 )
 from camera_source import CameraSource
 from detector import FaceDetector
@@ -51,6 +55,10 @@ GENDER_MIN_VOTES = 3
 AGE_HISTORY_SIZE = 7
 AGE_MIN_VOTES = 4
 
+EMOTION_HISTORY_SIZE = 7
+EMOTION_MIN_VOTES = 4
+EMOTION_CONFIDENCE_MIN = 0.45
+
 
 def ensure_track_attribute_fields(track: dict):
     # Gender
@@ -64,6 +72,18 @@ def ensure_track_attribute_fields(track: dict):
     track.setdefault("age_confidence", None)
     track.setdefault("age_history", [])
     track.setdefault("stable_age", None)
+
+    # Emotion
+    track.setdefault("emotion_prediction", None)
+    track.setdefault("emotion_confidence", None)
+    track.setdefault("emotion_history", [])
+    track.setdefault("stable_emotion", None)
+
+    # Emotion time accumulator
+    track.setdefault("emotion_current_state", None)
+    track.setdefault("emotion_state_start_ts", None)
+    track.setdefault("emotion_durations", {})
+    track.setdefault("emotion_session_start_str", None)
 
     # Shared attribute update timestamp
     track.setdefault("attribute_last_update_ts", 0.0)
@@ -82,6 +102,13 @@ def ensure_track_runtime_fields(track: dict):
     # Alert throttling
     track.setdefault("last_alert_ts", 0.0)
     track.setdefault("alert_person_id", None)
+
+
+def ensure_track_emotion_time_fields(track: dict):
+    track.setdefault("emotion_current_state", None)
+    track.setdefault("emotion_state_start_ts", None)
+    track.setdefault("emotion_durations", {})
+    track.setdefault("emotion_session_start_str", None)
 
 
 def should_update_attributes(track: dict) -> bool:
@@ -148,6 +175,114 @@ def update_stable_age(track: dict, predicted_age, confidence):
             track["stable_age"] = best_age
         elif best_count >= AGE_MIN_VOTES:
             track["stable_age"] = best_age
+
+
+def update_stable_emotion(track: dict, predicted_emotion, confidence):
+    if predicted_emotion is None:
+        return
+
+    if confidence is None or confidence < EMOTION_CONFIDENCE_MIN:
+        return
+
+    history = track.setdefault("emotion_history", [])
+    history.append(predicted_emotion)
+
+    if len(history) > EMOTION_HISTORY_SIZE:
+        history.pop(0)
+
+    counts = Counter(history)
+    best_emotion, best_count = counts.most_common(1)[0]
+
+    current_stable = track.get("stable_emotion")
+
+    if current_stable is None:
+        if best_count >= EMOTION_MIN_VOTES:
+            track["stable_emotion"] = best_emotion
+    else:
+        if best_emotion == current_stable:
+            track["stable_emotion"] = best_emotion
+        elif best_count >= EMOTION_MIN_VOTES:
+            track["stable_emotion"] = best_emotion
+
+
+def update_emotion_time_accumulator(track: dict, now_ts: float):
+    ensure_track_emotion_time_fields(track)
+
+    stable_emotion = track.get("stable_emotion")
+    current_state = track.get("emotion_current_state")
+    state_start_ts = track.get("emotion_state_start_ts")
+
+    if stable_emotion is None:
+        return
+
+    if current_state is None:
+        track["emotion_current_state"] = stable_emotion
+        track["emotion_state_start_ts"] = now_ts
+        if track.get("emotion_session_start_str") is None:
+            track["emotion_session_start_str"] = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M:%S")
+        return
+
+    if state_start_ts is None:
+        track["emotion_state_start_ts"] = now_ts
+        return
+
+    if stable_emotion != current_state:
+        elapsed = max(0.0, now_ts - state_start_ts)
+        durations = track.setdefault("emotion_durations", {})
+        durations[current_state] = durations.get(current_state, 0.0) + elapsed
+
+        track["emotion_current_state"] = stable_emotion
+        track["emotion_state_start_ts"] = now_ts
+
+
+def finalize_emotion_time_accumulator(track: dict, end_ts: float | None = None):
+    ensure_track_emotion_time_fields(track)
+
+    current_state = track.get("emotion_current_state")
+    state_start_ts = track.get("emotion_state_start_ts")
+
+    if current_state is None or state_start_ts is None:
+        return
+
+    if end_ts is None:
+        end_ts = time.time()
+
+    elapsed = max(0.0, end_ts - state_start_ts)
+    durations = track.setdefault("emotion_durations", {})
+    durations[current_state] = durations.get(current_state, 0.0) + elapsed
+
+    track["emotion_state_start_ts"] = end_ts
+
+
+def persist_track_emotion_durations(track: dict, person_id: str, person_type: str | None, zone_id: str):
+    durations = track.get("emotion_durations", {})
+    if not durations:
+        return
+
+    if track.get("_emotion_durations_persisted", False):
+        return
+
+    session_start = track.get("emotion_session_start_str")
+    end_ts = track.get("last_seen_ts") or time.time()
+    session_end = datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d %H:%M:%S")
+
+    for emotion, duration in durations.items():
+        if duration <= 0:
+            continue
+
+        add_emotion_session_stat(
+            person_id=person_id,
+            person_type=person_type,
+            camera_id=CAMERA_ID,
+            zone_id=zone_id,
+            track_id=track.get("track_id"),
+            session_start_time=session_start,
+            session_end_time=session_end,
+            emotion=emotion,
+            duration_seconds=duration,
+        )
+
+    track["_emotion_durations_persisted"] = True
 
 
 def load_locked_attributes_into_track(track: dict, person_id: str):
@@ -240,6 +375,7 @@ def get_person_snapshot(track: dict, person_id: str | None):
 
     predicted_gender = track.get("stable_gender") or track.get("gender_prediction")
     predicted_age_range = track.get("stable_age") or track.get("age_prediction")
+    predicted_emotion = track.get("stable_emotion") or track.get("emotion_prediction")
     attributes_locked = int(track.get("attributes_locked", False))
 
     if info:
@@ -255,14 +391,17 @@ def get_person_snapshot(track: dict, person_id: str | None):
         "person_status": info.get("status") if info else None,
         "predicted_gender": predicted_gender,
         "predicted_age_range": predicted_age_range,
+        "predicted_emotion": predicted_emotion,
         "attributes_locked": attributes_locked,
         "stable_gender": track.get("stable_gender"),
         "stable_age": track.get("stable_age"),
+        "stable_emotion": track.get("stable_emotion"),
         "identity_score": track.get("identity_score"),
         "access_granted_count": track.get("access_granted_count", 0),
         "access_denied_count": track.get("access_denied_count", 0),
         "access_alert_count": track.get("access_alert_count", 0),
     }
+
 
 # =========================================================
 # Drawing Helpers
@@ -297,7 +436,7 @@ def draw_track(frame, track, decision=None):
     cv2.putText(
         frame,
         top,
-        (x, max(20, y - 62)),
+        (x, max(20, y - 82)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
         color,
@@ -308,7 +447,7 @@ def draw_track(frame, track, decision=None):
         cv2.putText(
             frame,
             decision,
-            (x, max(20, y - 42)),
+            (x, max(20, y - 62)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
             color,
@@ -325,7 +464,12 @@ def draw_track(frame, track, decision=None):
     age_confidence = track.get("age_confidence")
     age_to_show = stable_age if stable_age else raw_age
 
-    y_line = max(20, y - 22)
+    stable_emotion = track.get("stable_emotion")
+    raw_emotion = track.get("emotion_prediction")
+    emotion_confidence = track.get("emotion_confidence")
+    emotion_to_show = stable_emotion if stable_emotion else raw_emotion
+
+    y_line = max(20, y - 42)
 
     if gender_to_show:
         gender_line = f"Gender: {gender_to_show}"
@@ -351,6 +495,22 @@ def draw_track(frame, track, decision=None):
         cv2.putText(
             frame,
             age_line,
+            (x, y_line),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            color,
+            2,
+        )
+        y_line += 20
+
+    if emotion_to_show:
+        emotion_line = f"Emotion: {emotion_to_show}"
+        if emotion_confidence is not None:
+            emotion_line += f" ({emotion_confidence:.2f})"
+
+        cv2.putText(
+            frame,
+            emotion_line,
             (x, y_line),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
@@ -426,6 +586,7 @@ def _build_live_active_summary(live_tracks: dict):
             "identity_score": track.get("identity_score"),
             "stable_gender": track.get("stable_gender"),
             "stable_age": track.get("stable_age"),
+            "stable_emotion": track.get("stable_emotion"),
             "access_granted_count": track.get("access_granted_count", 0),
             "access_denied_count": track.get("access_denied_count", 0),
             "access_alert_count": track.get("access_alert_count", 0),
@@ -458,6 +619,7 @@ def _merge_historical_and_live(report: dict, live_summary: dict):
                 "identity_score": None,
                 "stable_gender": None,
                 "stable_age": None,
+                "stable_emotion": None,
                 "access_granted_count": 0,
                 "access_denied_count": 0,
                 "access_alert_count": 0,
@@ -482,6 +644,7 @@ def _merge_historical_and_live(report: dict, live_summary: dict):
                     "identity_score": None,
                     "stable_gender": None,
                     "stable_age": None,
+                    "stable_emotion": None,
                     "access_granted_count": 0,
                     "access_denied_count": 0,
                     "access_alert_count": 0,
@@ -494,6 +657,7 @@ def _merge_historical_and_live(report: dict, live_summary: dict):
             merged[group_name][person_id]["identity_score"] = live_item.get("identity_score")
             merged[group_name][person_id]["stable_gender"] = live_item.get("stable_gender")
             merged[group_name][person_id]["stable_age"] = live_item.get("stable_age")
+            merged[group_name][person_id]["stable_emotion"] = live_item.get("stable_emotion")
             merged[group_name][person_id]["access_granted_count"] += live_item.get("access_granted_count", 0)
             merged[group_name][person_id]["access_denied_count"] += live_item.get("access_denied_count", 0)
             merged[group_name][person_id]["access_alert_count"] += live_item.get("access_alert_count", 0)
@@ -531,6 +695,7 @@ def _print_live_active_section(live_tracks: dict):
             print(f"      live identity score: {item['identity_score']}")
             print(f"      stable gender: {item['stable_gender']}")
             print(f"      stable age: {item['stable_age']}")
+            print(f"      stable emotion: {item['stable_emotion']}")
             print(f"      authorized count: {item['access_granted_count']}")
             print(f"      denied count:     {item['access_denied_count']}")
             print(f"      alert count:      {item['access_alert_count']}")
@@ -567,6 +732,7 @@ def _print_effective_group_section(title: str, items: list, include_work_hours: 
             print(f"      live identity score:     {item.get('identity_score')}")
             print(f"      stable gender:           {item.get('stable_gender')}")
             print(f"      stable age:              {item.get('stable_age')}")
+            print(f"      stable emotion:          {item.get('stable_emotion')}")
             print(f"      authorized count:        {item.get('access_granted_count', 0)}")
             print(f"      denied count:            {item.get('access_denied_count', 0)}")
             print(f"      alert count:             {item.get('access_alert_count', 0)}")
@@ -699,7 +865,7 @@ def main():
     print(f"[INFO] Zone ID: {zone_id}")
     print(f"[INFO] Zone Name: {zone_name}")
     print("[INFO] Press Q to quit")
-    print("[INFO] Press R to print today's analytics report + live active tracks + effective totals")
+    print("[INFO] Press R to print today's analytics report + emotion distributions")
 
     prev_time = time.time()
     fps = 0.0
@@ -716,6 +882,18 @@ def main():
             now_ts = time.time()
 
             for removed in removed_tracks:
+                if removed.get("identity"):
+                    finalize_emotion_time_accumulator(
+                        removed,
+                        end_ts=removed.get("last_seen_ts") or now_ts,
+                    )
+                    persist_track_emotion_durations(
+                        track=removed,
+                        person_id=removed.get("identity"),
+                        person_type=removed.get("identity_type"),
+                        zone_id=zone_id,
+                    )
+
                 session_service.on_track_removed(removed)
 
                 if removed.get("identity"):
@@ -734,6 +912,7 @@ def main():
                             "reason": "track_timeout",
                             "seen_frames": removed.get("seen_frames"),
                             "missing_frames": removed.get("missing_frames"),
+                            "emotion_durations": removed.get("emotion_durations", {}),
                         },
                         extra_fields=snapshot,
                     )
@@ -884,7 +1063,6 @@ def main():
                 if (
                     person_id
                     and person_type in ("employee", "visitor", "unknown")
-                    and not track.get("attributes_locked", False)
                     and should_update_attributes(track)
                     and face_large_enough_for_attributes(track)
                 ):
@@ -894,6 +1072,8 @@ def main():
                     new_gender_conf = attr_result.get("gender_confidence")
                     new_age = attr_result.get("age_prediction")
                     new_age_conf = attr_result.get("age_confidence")
+                    new_emotion = attr_result.get("emotion_prediction")
+                    new_emotion_conf = attr_result.get("emotion_confidence")
 
                     old_stable_gender = track.get("stable_gender")
                     old_raw_gender = track.get("gender_prediction")
@@ -903,36 +1083,72 @@ def main():
                     old_raw_age = track.get("age_prediction")
                     old_raw_age_conf = track.get("age_confidence")
 
-                    track["gender_prediction"] = new_gender
-                    track["gender_confidence"] = new_gender_conf
-                    track["age_prediction"] = new_age
-                    track["age_confidence"] = new_age_conf
-                    track["attribute_last_update_ts"] = now_ts
+                    old_stable_emotion = track.get("stable_emotion")
+                    old_raw_emotion = track.get("emotion_prediction")
+                    old_raw_emotion_conf = track.get("emotion_confidence")
 
-                    update_stable_gender(track, new_gender, new_gender_conf)
-                    update_stable_age(track, new_age, new_age_conf)
+                    # Emotion always updates
+                    track["emotion_prediction"] = new_emotion
+                    track["emotion_confidence"] = new_emotion_conf
+                    update_stable_emotion(track, new_emotion, new_emotion_conf)
+                    update_emotion_time_accumulator(track, now_ts)
+
+                    # Keep old sample table too, for debug/history
+                    emotion_to_store = track.get("stable_emotion") or track.get("emotion_prediction")
+                    emotion_conf_to_store = track.get("emotion_confidence")
+                    if emotion_to_store and emotion_conf_to_store is not None:
+                        add_emotion_sample(
+                            camera_id=CAMERA_ID,
+                            zone_id=zone_id,
+                            track_id=track_id,
+                            person_id=person_id,
+                            person_type=person_type,
+                            emotion=emotion_to_store,
+                            confidence=emotion_conf_to_store,
+                        )
+
+                    # Gender / age only update if not locked
+                    if not track.get("attributes_locked", False):
+                        track["gender_prediction"] = new_gender
+                        track["gender_confidence"] = new_gender_conf
+                        track["age_prediction"] = new_age
+                        track["age_confidence"] = new_age_conf
+
+                        update_stable_gender(track, new_gender, new_gender_conf)
+                        update_stable_age(track, new_age, new_age_conf)
+
+                    track["attribute_last_update_ts"] = now_ts
 
                     stable_gender_changed = old_stable_gender != track.get("stable_gender")
                     stable_age_changed = old_stable_age != track.get("stable_age")
+                    stable_emotion_changed = old_stable_emotion != track.get("stable_emotion")
 
                     raw_gender_changed = (
-                        old_raw_gender != new_gender
-                        or round(old_raw_gender_conf or 0.0, 3) != round(new_gender_conf or 0.0, 3)
+                        old_raw_gender != track.get("gender_prediction")
+                        or round(old_raw_gender_conf or 0.0, 3) != round(track.get("gender_confidence") or 0.0, 3)
                     )
 
                     raw_age_changed = (
-                        old_raw_age != new_age
-                        or round(old_raw_age_conf or 0.0, 3) != round(new_age_conf or 0.0, 3)
+                        old_raw_age != track.get("age_prediction")
+                        or round(old_raw_age_conf or 0.0, 3) != round(track.get("age_confidence") or 0.0, 3)
+                    )
+
+                    raw_emotion_changed = (
+                        old_raw_emotion != track.get("emotion_prediction")
+                        or round(old_raw_emotion_conf or 0.0, 3) != round(track.get("emotion_confidence") or 0.0, 3)
                     )
 
                     if (
-                        (new_gender or new_age)
-                        and (
-                            stable_gender_changed
-                            or raw_gender_changed
-                            or stable_age_changed
-                            or raw_age_changed
-                        )
+                        track.get("gender_prediction")
+                        or track.get("age_prediction")
+                        or track.get("emotion_prediction")
+                    ) and (
+                        stable_gender_changed
+                        or raw_gender_changed
+                        or stable_age_changed
+                        or raw_age_changed
+                        or stable_emotion_changed
+                        or raw_emotion_changed
                     ):
                         snapshot = get_person_snapshot(track, person_id)
 
@@ -947,37 +1163,43 @@ def main():
                             person_type=person_type,
                             confidence=track.get("identity_score"),
                             payload={
-                                "gender_prediction": new_gender,
-                                "gender_confidence": new_gender_conf,
+                                "gender_prediction": track.get("gender_prediction"),
+                                "gender_confidence": track.get("gender_confidence"),
                                 "stable_gender": track.get("stable_gender"),
                                 "gender_history": track.get("gender_history", []),
-                                "age_prediction": new_age,
-                                "age_confidence": new_age_conf,
+                                "age_prediction": track.get("age_prediction"),
+                                "age_confidence": track.get("age_confidence"),
                                 "stable_age": track.get("stable_age"),
                                 "age_history": track.get("age_history", []),
+                                "emotion_prediction": track.get("emotion_prediction"),
+                                "emotion_confidence": track.get("emotion_confidence"),
+                                "stable_emotion": track.get("stable_emotion"),
+                                "emotion_history": track.get("emotion_history", []),
+                                "emotion_durations": track.get("emotion_durations", {}),
                             },
                             extra_fields=snapshot,
                         )
 
-                    if try_lock_attributes_for_identity(track, person_id):
-                        snapshot = get_person_snapshot(track, person_id)
+                    if not track.get("attributes_locked", False):
+                        if try_lock_attributes_for_identity(track, person_id):
+                            snapshot = get_person_snapshot(track, person_id)
 
-                        log_system_event(
-                            mqtt_service=mqtt_service,
-                            event_type="attributes_locked",
-                            camera_id=CAMERA_ID,
-                            zone_id=zone_id,
-                            zone_name=zone_name,
-                            track_id=track_id,
-                            person_id=person_id,
-                            person_type=person_type,
-                            confidence=track.get("identity_score"),
-                            payload={
-                                "predicted_gender": track.get("stable_gender"),
-                                "predicted_age_range": track.get("stable_age"),
-                            },
-                            extra_fields=snapshot,
-                        )
+                            log_system_event(
+                                mqtt_service=mqtt_service,
+                                event_type="attributes_locked",
+                                camera_id=CAMERA_ID,
+                                zone_id=zone_id,
+                                zone_name=zone_name,
+                                track_id=track_id,
+                                person_id=person_id,
+                                person_type=person_type,
+                                confidence=track.get("identity_score"),
+                                payload={
+                                    "predicted_gender": track.get("stable_gender"),
+                                    "predicted_age_range": track.get("stable_age"),
+                                },
+                                extra_fields=snapshot,
+                            )
 
                 decision, reason = authorization_service.decide(
                     person_id=person_id,
@@ -1064,22 +1286,22 @@ def main():
                         )
 
                         publish_event(
-mqtt_service,
-    {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "camera_id": CAMERA_ID,
-        "zone_id": zone_id,
-        "zone_name": zone_name,
-        "track_id": track_id,
-        "person_id": person_id,
-        "person_type": person_type,
-        "alert_type": "UNKNOWN_PENDING_VALIDATION",
-        "reason": reason,
-        "alert_status": "open",
-        **snapshot,
-    },
-    kind="alert",
-)
+                            mqtt_service,
+                            {
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "camera_id": CAMERA_ID,
+                                "zone_id": zone_id,
+                                "zone_name": zone_name,
+                                "track_id": track_id,
+                                "person_id": person_id,
+                                "person_type": person_type,
+                                "alert_type": "UNKNOWN_PENDING_VALIDATION",
+                                "reason": reason,
+                                "alert_status": "open",
+                                **snapshot,
+                            },
+                            kind="alert",
+                        )
 
                         log_system_event(
                             mqtt_service=mqtt_service,
@@ -1112,8 +1334,60 @@ mqtt_service,
                 today_str = datetime.now().strftime("%Y-%m-%d")
                 print_daily_report(today_str, tracker.tracks)
 
+                printed = set()
+                for _, track in tracker.tracks.items():
+                    person_id = track.get("identity")
+                    person_type = track.get("identity_type")
+
+                    if not person_id or person_id in printed:
+                        continue
+
+                    if person_type not in ("employee", "visitor", "unknown"):
+                        continue
+
+                    sample_dist = get_person_emotion_distribution(person_id, today_str)
+                    time_dist = get_person_emotion_time_distribution(person_id, today_str)
+
+                    print(f"\n[EMOTION SAMPLE DISTRIBUTION] {person_id}")
+                    print(f"Total samples: {sample_dist['total_samples']}")
+                    if not sample_dist["distribution"]:
+                        print("  No emotion samples.")
+                    else:
+                        for item in sample_dist["distribution"]:
+                            print(
+                                f"  - {item['emotion']}: "
+                                f"{item['sample_count']} sample(s), "
+                                f"{item['percentage']:.2f}%"
+                            )
+
+                    print(f"\n[EMOTION TIME DISTRIBUTION] {person_id}")
+                    print(f"Total emotion time: {time_dist['total_duration_seconds']:.2f} sec")
+                    if not time_dist["distribution"]:
+                        print("  No emotion duration data.")
+                    else:
+                        for item in time_dist["distribution"]:
+                            print(
+                                f"  - {item['emotion']}: "
+                                f"{item['duration_seconds']:.2f} sec, "
+                                f"{item['percentage']:.2f}%"
+                            )
+
+                    printed.add(person_id)
+
     finally:
         for track in list(tracker.tracks.values()):
+            if track.get("identity"):
+                finalize_emotion_time_accumulator(
+                    track,
+                    end_ts=track.get("last_seen_ts") or time.time(),
+                )
+                persist_track_emotion_durations(
+                    track=track,
+                    person_id=track.get("identity"),
+                    person_type=track.get("identity_type"),
+                    zone_id=zone_id,
+                )
+
             session_service.on_track_removed(track)
 
         camera.release()
