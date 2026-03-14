@@ -108,6 +108,30 @@ class AttributeService:
 
         return crop
 
+    def _is_crop_quality_good_enough(self, face_crop):
+        """
+        Cheap quality gate to reduce noisy predictions.
+        Rejects very dark, very blurry, or too-small crops.
+        """
+        if face_crop is None or face_crop.size == 0:
+            return False
+
+        h, w = face_crop.shape[:2]
+        if w < 60 or h < 60:
+            return False
+
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+
+        mean_brightness = float(np.mean(gray))
+        if mean_brightness < 25:
+            return False
+
+        blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        if blur_score < 35:
+            return False
+
+        return True
+
     def _prepare_tensor(self, face_crop):
         if face_crop is None or face_crop.size == 0:
             return None
@@ -117,11 +141,28 @@ class AttributeService:
         return tensor
 
     def predict_attributes(self, frame, bbox):
+        """
+        Returns:
+        {
+            "gender_prediction": str | None,
+            "gender_confidence": float | None,
+            "age_prediction": str | None,
+            "age_confidence": float | None,
+        }
+
+        Important:
+        - gender_prediction is filtered by confidence threshold
+        - age_prediction is always returned when inference succeeds
+        - caller decides stability and DB locking
+        """
         if self.model is None:
             return self._empty_result()
 
         face_crop = self._safe_crop_face(frame, bbox)
         if face_crop is None:
+            return self._empty_result()
+
+        if not self._is_crop_quality_good_enough(face_crop):
             return self._empty_result()
 
         try:
@@ -149,8 +190,8 @@ class AttributeService:
                     f"AGE_LABELS has {len(self.AGE_LABELS)} labels but model returned {len(age_logits)} age logits"
                 )
 
-            gender_probs = F.softmax(gender_logits, dim=0).cpu().numpy()
-            age_probs = F.softmax(age_logits, dim=0).cpu().numpy()
+            gender_probs = F.softmax(gender_logits, dim=0).detach().cpu().numpy()
+            age_probs = F.softmax(age_logits, dim=0).detach().cpu().numpy()
 
             gender_idx = int(np.argmax(gender_probs))
             age_idx = int(np.argmax(age_probs))

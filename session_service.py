@@ -27,21 +27,21 @@ class SessionService:
         track.setdefault("visible_session_start_str", None)
         track.setdefault("last_seen_ts", None)
 
-        # count of visible session segments created by this track lifecycle
-        track.setdefault("appearance_count", 0)
+        # Number of visible session segments created within this current track lifecycle
+        track.setdefault("visible_segment_count", 0)
 
-        # cumulative hint only for runtime/debug display, not authoritative DB analytics
+        # Runtime/debug only, not authoritative DB analytics
         track.setdefault("total_visible_time_hint_sec", 0.0)
 
-        # access session state
+        # Access session state
         track.setdefault("access_session_open", False)
 
-        # extra counters for future analytics/debug
+        # Runtime counters for live reporting/debug
         track.setdefault("access_granted_count", 0)
         track.setdefault("access_denied_count", 0)
         track.setdefault("access_alert_count", 0)
 
-        # remember last decision to avoid meaningless counter inflation if needed later
+        # Last recorded access decision info
         track.setdefault("last_access_decision", None)
         track.setdefault("last_access_decision_ts", 0.0)
 
@@ -74,13 +74,13 @@ class SessionService:
             start_time=self._ts_to_str(start_ts),
             end_time=self._ts_to_str(end_ts),
             duration_seconds=duration,
-            appearance_count=track.get("appearance_count", 1),
+            appearance_count=track.get("visible_segment_count", 1),
         )
 
         track["total_visible_time_hint_sec"] = track.get("total_visible_time_hint_sec", 0.0) + duration
         track["visible_session_start_ts"] = None
         track["visible_session_start_str"] = None
-        track["appearance_count"] = 0
+        track["visible_segment_count"] = 0
 
     def _finalize_access_session(self, track, person_id):
         self._ensure_track_session_fields(track)
@@ -96,7 +96,7 @@ class SessionService:
         now_ts = time.time()
         last_seen_ts = track.get("last_seen_ts")
 
-        # If person was absent long enough, split visible session
+        # Split visible session if person was absent too long
         if (
             last_seen_ts is not None
             and track.get("visible_session_start_ts") is not None
@@ -109,7 +109,7 @@ class SessionService:
                 end_ts=last_seen_ts,
             )
 
-        # If access gap is too long, close and reopen access session
+        # Close stale access session if gap is too long
         if (
             last_seen_ts is not None
             and track.get("access_session_open", False)
@@ -121,7 +121,7 @@ class SessionService:
         if track.get("visible_session_start_ts") is None:
             track["visible_session_start_ts"] = now_ts
             track["visible_session_start_str"] = self._ts_to_str(now_ts)
-            track["appearance_count"] = track.get("appearance_count", 0) + 1
+            track["visible_segment_count"] = track.get("visible_segment_count", 0) + 1
 
         # Start a new access session if needed
         if person_id and not track.get("access_session_open", False):
@@ -137,8 +137,9 @@ class SessionService:
 
     def record_access_decision(self, track, decision: str):
         """
-        Lightweight runtime counters for future analytics/debug.
-        Does not replace authoritative DB events.
+        Lightweight runtime counters for live reporting/debug.
+        Intended to be called only when the caller has already decided
+        this access decision is worth recording.
         """
         self._ensure_track_session_fields(track)
 

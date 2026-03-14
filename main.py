@@ -26,6 +26,8 @@ from database import (
     add_system_event,
     update_last_seen,
     get_grouped_daily_report,
+    get_identity_attributes,
+    save_identity_attributes,
 )
 from camera_source import CameraSource
 from detector import FaceDetector
@@ -64,6 +66,21 @@ def ensure_track_attribute_fields(track: dict):
 
     # Shared attribute update timestamp
     track.setdefault("attribute_last_update_ts", 0.0)
+
+    # DB-locked attributes state
+    track.setdefault("attributes_loaded_from_db", False)
+    track.setdefault("attributes_locked", False)
+
+
+def ensure_track_runtime_fields(track: dict):
+    # Access decision logging
+    track.setdefault("last_logged_ts", 0.0)
+    track.setdefault("last_logged_decision", None)
+    track.setdefault("last_logged_reason", None)
+
+    # Alert throttling
+    track.setdefault("last_alert_ts", 0.0)
+    track.setdefault("alert_person_id", None)
 
 
 def should_update_attributes(track: dict) -> bool:
@@ -130,6 +147,82 @@ def update_stable_age(track: dict, predicted_age, confidence):
             track["stable_age"] = best_age
         elif best_count >= AGE_MIN_VOTES:
             track["stable_age"] = best_age
+
+
+def load_locked_attributes_into_track(track: dict, person_id: str):
+    attrs = get_identity_attributes(person_id)
+    if not attrs:
+        return
+
+    if int(attrs.get("attributes_locked", 0)) != 1:
+        return
+
+    track["stable_gender"] = attrs.get("predicted_gender")
+    track["stable_age"] = attrs.get("predicted_age_range")
+
+    track["gender_prediction"] = attrs.get("predicted_gender")
+    track["age_prediction"] = attrs.get("predicted_age_range")
+
+    track["gender_confidence"] = None
+    track["age_confidence"] = None
+
+    track["attributes_locked"] = True
+    track["attributes_loaded_from_db"] = True
+
+
+def try_lock_attributes_for_identity(track: dict, person_id: str) -> bool:
+    stable_gender = track.get("stable_gender")
+    stable_age = track.get("stable_age")
+
+    if not stable_gender or not stable_age:
+        return False
+
+    save_identity_attributes(
+        person_id=person_id,
+        predicted_gender=stable_gender,
+        predicted_age_range=stable_age,
+        lock_attributes=1,
+    )
+
+    track["gender_prediction"] = stable_gender
+    track["age_prediction"] = stable_age
+    track["gender_confidence"] = None
+    track["age_confidence"] = None
+    track["attributes_locked"] = True
+    track["attributes_loaded_from_db"] = True
+
+    return True
+
+
+def should_log_access_decision(track: dict, decision: str, reason: str, now_ts: float) -> bool:
+    last_ts = track.get("last_logged_ts", 0.0)
+    last_decision = track.get("last_logged_decision")
+    last_reason = track.get("last_logged_reason")
+
+    decision_changed = decision != last_decision
+    reason_changed = reason != last_reason
+    cooldown_elapsed = (now_ts - last_ts) >= LOG_COOLDOWN_SEC
+
+    return decision_changed or reason_changed or cooldown_elapsed
+
+
+def should_create_alert(track: dict, person_id: str | None, now_ts: float) -> bool:
+    last_alert_ts = track.get("last_alert_ts", 0.0)
+    alert_person_id = track.get("alert_person_id")
+
+    person_changed = person_id != alert_person_id
+    cooldown_elapsed = (now_ts - last_alert_ts) >= LOG_COOLDOWN_SEC
+
+    return person_changed or cooldown_elapsed
+
+
+def reset_alert_state_if_needed(track: dict, decision: str, person_id: str | None):
+    if decision != "ALERT_PENDING":
+        track["alert_person_id"] = None
+        return
+
+    if track.get("alert_person_id") is not None and track.get("alert_person_id") != person_id:
+        track["alert_person_id"] = None
 
 
 # =========================================================
@@ -310,7 +403,6 @@ def _merge_historical_and_live(report: dict, live_summary: dict):
     }
 
     for group_name in ("employee", "visitor", "unknown"):
-        # Start from historical DB report
         for item in report[group_name]:
             merged[group_name][item["person_id"]] = {
                 "person_id": item["person_id"],
@@ -332,7 +424,6 @@ def _merge_historical_and_live(report: dict, live_summary: dict):
                 "access_alert_count": 0,
             }
 
-        # Add live layer
         for live_item in live_summary[group_name]:
             person_id = live_item["person_id"]
 
@@ -368,7 +459,6 @@ def _merge_historical_and_live(report: dict, live_summary: dict):
             merged[group_name][person_id]["access_denied_count"] += live_item.get("access_denied_count", 0)
             merged[group_name][person_id]["access_alert_count"] += live_item.get("access_alert_count", 0)
 
-        # Sort by effective visible time descending
         merged[group_name] = sorted(
             merged[group_name].values(),
             key=lambda x: (x.get("effective_visible_seconds", 0.0), x["person_id"]),
@@ -626,6 +716,7 @@ def main():
 
             for track_id, track in live_tracks.items():
                 ensure_track_attribute_fields(track)
+                ensure_track_runtime_fields(track)
 
                 if not track["updated"]:
                     draw_track(frame, track)
@@ -720,13 +811,25 @@ def main():
                         },
                     )
 
-                # -------------------------------------------------
-                # Unified attribute prediction: gender + age
-                # -------------------------------------------------
+                person_id = track.get("identity")
+                person_type = track.get("identity_type")
+
+                # ---------------------------------------------
+                # Load locked attributes once from DB
+                # ---------------------------------------------
+                if person_id and person_type in ("employee", "visitor", "unknown"):
+                    if not track.get("attributes_loaded_from_db", False):
+                        load_locked_attributes_into_track(track, person_id)
+
+                # ---------------------------------------------
+                # Predict attributes only when NOT locked
+                # ---------------------------------------------
                 if (
-                    should_update_attributes(track)
+                    person_id
+                    and person_type in ("employee", "visitor", "unknown")
+                    and not track.get("attributes_locked", False)
+                    and should_update_attributes(track)
                     and face_large_enough_for_attributes(track)
-                    and track.get("identity_type") in ("employee", "visitor", "unknown")
                 ):
                     attr_result = attribute_service.predict_attributes(frame, track["bbox"])
 
@@ -780,8 +883,8 @@ def main():
                             camera_id=CAMERA_ID,
                             zone_id=zone_id,
                             track_id=track_id,
-                            person_id=track.get("identity"),
-                            person_type=track.get("identity_type"),
+                            person_id=person_id,
+                            person_type=person_type,
                             confidence=track.get("identity_score"),
                             payload={
                                 "gender_prediction": new_gender,
@@ -795,8 +898,22 @@ def main():
                             },
                         )
 
-                person_id = track.get("identity")
-                person_type = track.get("identity_type")
+                    # Lock permanently once both values are stable
+                    if try_lock_attributes_for_identity(track, person_id):
+                        log_system_event(
+                            mqtt_service=mqtt_service,
+                            event_type="attributes_locked",
+                            camera_id=CAMERA_ID,
+                            zone_id=zone_id,
+                            track_id=track_id,
+                            person_id=person_id,
+                            person_type=person_type,
+                            confidence=track.get("identity_score"),
+                            payload={
+                                "predicted_gender": track.get("stable_gender"),
+                                "predicted_age_range": track.get("stable_age"),
+                            },
+                        )
 
                 decision, reason = authorization_service.decide(
                     person_id=person_id,
@@ -805,15 +922,16 @@ def main():
                     zone_id=zone_id,
                 )
 
-                session_service.record_access_decision(track, decision)
+                reset_alert_state_if_needed(track, decision, person_id)
 
                 if person_id and person_type in ("employee", "visitor", "unknown"):
                     update_last_seen(person_id)
                     session_service.on_track_seen(track, person_id)
 
                 if person_id:
-                    since_last_log = now_ts - track.get("last_logged_ts", 0)
-                    if since_last_log >= LOG_COOLDOWN_SEC:
+                    if should_log_access_decision(track, decision, reason, now_ts):
+                        session_service.record_access_decision(track, decision)
+
                         add_access_event(
                             camera_id=CAMERA_ID,
                             zone_id=zone_id,
@@ -857,51 +975,55 @@ def main():
                         )
 
                         track["last_logged_ts"] = now_ts
+                        track["last_logged_decision"] = decision
+                        track["last_logged_reason"] = reason
 
-                if decision == "ALERT_PENDING" and not track.get("pending_alert_sent", False):
-                    add_alert(
-                        camera_id=CAMERA_ID,
-                        zone_id=zone_id,
-                        track_id=track_id,
-                        person_id=person_id,
-                        person_type=person_type,
-                        alert_type="UNKNOWN_PENDING_VALIDATION",
-                        notes=reason,
-                        status="open",
-                    )
+                if decision == "ALERT_PENDING" and person_id:
+                    if should_create_alert(track, person_id, now_ts):
+                        add_alert(
+                            camera_id=CAMERA_ID,
+                            zone_id=zone_id,
+                            track_id=track_id,
+                            person_id=person_id,
+                            person_type=person_type,
+                            alert_type="UNKNOWN_PENDING_VALIDATION",
+                            notes=reason,
+                            status="open",
+                        )
 
-                    publish_event(
-                        mqtt_service,
-                        {
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "camera_id": CAMERA_ID,
-                            "zone_id": zone_id,
-                            "track_id": track_id,
-                            "person_id": person_id,
-                            "person_type": person_type,
-                            "alert_type": "UNKNOWN_PENDING_VALIDATION",
-                            "reason": reason,
-                            "status": "open",
-                        },
-                        kind="alert",
-                    )
+                        publish_event(
+                            mqtt_service,
+                            {
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "camera_id": CAMERA_ID,
+                                "zone_id": zone_id,
+                                "track_id": track_id,
+                                "person_id": person_id,
+                                "person_type": person_type,
+                                "alert_type": "UNKNOWN_PENDING_VALIDATION",
+                                "reason": reason,
+                                "status": "open",
+                            },
+                            kind="alert",
+                        )
 
-                    log_system_event(
-                        mqtt_service=mqtt_service,
-                        event_type="alert_created",
-                        camera_id=CAMERA_ID,
-                        zone_id=zone_id,
-                        track_id=track_id,
-                        person_id=person_id,
-                        person_type=person_type,
-                        confidence=track.get("identity_score"),
-                        payload={
-                            "alert_type": "UNKNOWN_PENDING_VALIDATION",
-                            "reason": reason,
-                        },
-                    )
+                        log_system_event(
+                            mqtt_service=mqtt_service,
+                            event_type="alert_created",
+                            camera_id=CAMERA_ID,
+                            zone_id=zone_id,
+                            track_id=track_id,
+                            person_id=person_id,
+                            person_type=person_type,
+                            confidence=track.get("identity_score"),
+                            payload={
+                                "alert_type": "UNKNOWN_PENDING_VALIDATION",
+                                "reason": reason,
+                            },
+                        )
 
-                    track["pending_alert_sent"] = True
+                        track["last_alert_ts"] = now_ts
+                        track["alert_person_id"] = person_id
 
                 draw_track(frame, track, decision)
 

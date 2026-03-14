@@ -53,6 +53,58 @@ def _ensure_column(conn, table_name: str, column_name: str, column_sql: str):
         conn.commit()
 
 
+def _ensure_indexes(conn):
+    c = conn.cursor()
+
+    c.execute("CREATE INDEX IF NOT EXISTS idx_face_embeddings_person_id ON face_embeddings(person_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_identities_person_type_status ON identities(person_type, status)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_identities_last_seen ON identities(last_seen)")
+
+    c.execute("CREATE INDEX IF NOT EXISTS idx_camera_zones_camera_active ON camera_zones(camera_id, is_active)")
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_access_policies_lookup
+    ON access_policies(subject_type, subject_value, zone_id, is_active)
+    """)
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_visible_sessions_person_date
+    ON visible_sessions(person_id, start_time)
+    """)
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_access_sessions_person_zone_status
+    ON access_sessions(person_id, zone_id, status)
+    """)
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_access_events_person_time
+    ON access_events(person_id, timestamp)
+    """)
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_alerts_person_time
+    ON alerts(person_id, timestamp)
+    """)
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_system_events_person_time
+    ON system_events(person_id, timestamp)
+    """)
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_work_schedules_active
+    ON work_schedules(is_active)
+    """)
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_identities_attributes_locked
+    ON identities(attributes_locked)
+    """)
+
+    conn.commit()
+
+
 # =========================================================
 # Database Initialization
 # =========================================================
@@ -102,6 +154,18 @@ def init_db():
         valid_from TEXT,
         valid_to TEXT,
         FOREIGN KEY (person_id) REFERENCES identities(person_id)
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS work_schedules (
+        schedule_id TEXT PRIMARY KEY,
+        schedule_name TEXT NOT NULL,
+        allowed_days TEXT NOT NULL,
+        start_time TEXT NOT NULL,
+        end_time TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
     )
     """)
 
@@ -214,6 +278,14 @@ def init_db():
     _ensure_column(conn, "identities", "resolved_at", "TEXT")
     _ensure_column(conn, "identities", "resolution_note", "TEXT")
 
+    # -----------------------------------------------------
+    # Attribute locking columns
+    # -----------------------------------------------------
+    _ensure_column(conn, "identities", "predicted_gender", "TEXT")
+    _ensure_column(conn, "identities", "predicted_age_range", "TEXT")
+    _ensure_column(conn, "identities", "attributes_locked", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "identities", "attributes_updated_at", "TEXT")
+
     c.execute("""
     INSERT OR IGNORE INTO camera_zones (
         zone_id, camera_id, zone_name, zone_type, is_access_point, is_active, created_at
@@ -227,6 +299,8 @@ def init_db():
         DEFAULT_IS_ACCESS_POINT,
         now_str(),
     ))
+
+    _ensure_indexes(conn)
 
     conn.commit()
     conn.close()
@@ -288,9 +362,10 @@ def ensure_identity(
         c.execute("""
         INSERT INTO identities (
             person_id, person_type, display_name, status, created_at, last_seen,
-            is_active, merged_into_person_id, resolved_at, resolution_note
+            is_active, merged_into_person_id, resolved_at, resolution_note,
+            predicted_gender, predicted_age_range, attributes_locked, attributes_updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, NULL)
         """, (person_id, person_type, display_name, status, now, now, is_active))
     else:
         c.execute("""
@@ -325,7 +400,10 @@ def get_identity_info(person_id: str):
     c.execute("""
     SELECT person_id, person_type, display_name, status,
            COALESCE(is_active, 1) AS is_active,
-           merged_into_person_id, resolved_at, resolution_note
+           merged_into_person_id, resolved_at, resolution_note,
+           predicted_gender, predicted_age_range,
+           COALESCE(attributes_locked, 0) AS attributes_locked,
+           attributes_updated_at
     FROM identities
     WHERE person_id = ?
     """, (person_id,))
@@ -344,7 +422,93 @@ def get_identity_info(person_id: str):
         "merged_into_person_id": row["merged_into_person_id"],
         "resolved_at": row["resolved_at"],
         "resolution_note": row["resolution_note"],
+        "predicted_gender": row["predicted_gender"],
+        "predicted_age_range": row["predicted_age_range"],
+        "attributes_locked": int(row["attributes_locked"]),
+        "attributes_updated_at": row["attributes_updated_at"],
     }
+
+
+def get_identity_attributes(person_id: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    SELECT predicted_gender, predicted_age_range,
+           COALESCE(attributes_locked, 0) AS attributes_locked,
+           attributes_updated_at
+    FROM identities
+    WHERE person_id = ?
+    """, (person_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "predicted_gender": row["predicted_gender"],
+        "predicted_age_range": row["predicted_age_range"],
+        "attributes_locked": int(row["attributes_locked"]),
+        "attributes_updated_at": row["attributes_updated_at"],
+    }
+
+
+def save_identity_attributes(
+    person_id: str,
+    predicted_gender: str | None = None,
+    predicted_age_range: str | None = None,
+    lock_attributes: int = 1,
+):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    UPDATE identities
+    SET predicted_gender = COALESCE(?, predicted_gender),
+        predicted_age_range = COALESCE(?, predicted_age_range),
+        attributes_locked = ?,
+        attributes_updated_at = ?
+    WHERE person_id = ?
+    """, (
+        predicted_gender,
+        predicted_age_range,
+        int(lock_attributes),
+        now_str(),
+        person_id,
+    ))
+    conn.commit()
+    conn.close()
+
+
+def clear_identity_attributes(person_id: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    UPDATE identities
+    SET predicted_gender = NULL,
+        predicted_age_range = NULL,
+        attributes_locked = 0,
+        attributes_updated_at = ?
+    WHERE person_id = ?
+    """, (now_str(), person_id))
+    conn.commit()
+    conn.close()
+
+
+def are_attributes_locked(person_id: str) -> bool:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    SELECT COALESCE(attributes_locked, 0) AS attributes_locked
+    FROM identities
+    WHERE person_id = ?
+    """, (person_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        return False
+
+    return int(row["attributes_locked"]) == 1
 
 
 def get_all_identities():
@@ -353,7 +517,10 @@ def get_all_identities():
     c.execute("""
     SELECT person_id, person_type, display_name, status,
            COALESCE(is_active, 1) AS is_active,
-           merged_into_person_id, resolved_at, resolution_note
+           merged_into_person_id, resolved_at, resolution_note,
+           predicted_gender, predicted_age_range,
+           COALESCE(attributes_locked, 0) AS attributes_locked,
+           attributes_updated_at
     FROM identities
     ORDER BY person_type ASC, person_id ASC
     """)
@@ -370,6 +537,10 @@ def get_all_identities():
             "merged_into_person_id": row["merged_into_person_id"],
             "resolved_at": row["resolved_at"],
             "resolution_note": row["resolution_note"],
+            "predicted_gender": row["predicted_gender"],
+            "predicted_age_range": row["predicted_age_range"],
+            "attributes_locked": int(row["attributes_locked"]),
+            "attributes_updated_at": row["attributes_updated_at"],
         }
         for row in rows
     ]
@@ -573,6 +744,121 @@ def get_all_identities_with_embeddings():
         )
         for row in rows
     ]
+
+
+# =========================================================
+# Work Schedules
+# =========================================================
+
+def create_work_schedule(
+    schedule_id: str,
+    schedule_name: str,
+    allowed_days: str,
+    start_time: str,
+    end_time: str,
+    is_active: int = 1,
+):
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("""
+    INSERT OR REPLACE INTO work_schedules (
+        schedule_id, schedule_name, allowed_days, start_time, end_time, is_active, created_at
+    )
+    VALUES (
+        ?, ?, ?, ?, ?, ?,
+        COALESCE((SELECT created_at FROM work_schedules WHERE schedule_id = ?), ?)
+    )
+    """, (
+        schedule_id,
+        schedule_name,
+        allowed_days,
+        start_time,
+        end_time,
+        is_active,
+        schedule_id,
+        now_str(),
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_work_schedule(schedule_id: str):
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("""
+    SELECT schedule_id, schedule_name, allowed_days, start_time, end_time, is_active, created_at
+    FROM work_schedules
+    WHERE schedule_id = ?
+    """, (schedule_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "schedule_id": row["schedule_id"],
+        "schedule_name": row["schedule_name"],
+        "allowed_days": row["allowed_days"],
+        "start_time": row["start_time"],
+        "end_time": row["end_time"],
+        "is_active": int(row["is_active"]),
+        "created_at": row["created_at"],
+    }
+
+
+def get_all_work_schedules(active_only: bool = False):
+    conn = get_conn()
+    c = conn.cursor()
+
+    if active_only:
+        c.execute("""
+        SELECT schedule_id, schedule_name, allowed_days, start_time, end_time, is_active, created_at
+        FROM work_schedules
+        WHERE is_active = 1
+        ORDER BY schedule_name ASC, schedule_id ASC
+        """)
+    else:
+        c.execute("""
+        SELECT schedule_id, schedule_name, allowed_days, start_time, end_time, is_active, created_at
+        FROM work_schedules
+        ORDER BY schedule_name ASC, schedule_id ASC
+        """)
+
+    rows = c.fetchall()
+    conn.close()
+
+    return [
+        {
+            "schedule_id": row["schedule_id"],
+            "schedule_name": row["schedule_name"],
+            "allowed_days": row["allowed_days"],
+            "start_time": row["start_time"],
+            "end_time": row["end_time"],
+            "is_active": int(row["is_active"]),
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def delete_work_schedule(schedule_id: str) -> bool:
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("SELECT 1 FROM work_schedules WHERE schedule_id = ?", (schedule_id,))
+    row = c.fetchone()
+    if row is None:
+        conn.close()
+        return False
+
+    c.execute("DELETE FROM work_schedules WHERE schedule_id = ?", (schedule_id,))
+    conn.commit()
+    conn.close()
+    return True
 
 
 # =========================================================
@@ -845,13 +1131,14 @@ def close_access_session(person_id: str, zone_id: str):
         entry_time = row["entry_time"]
 
         fmt = "%Y-%m-%d %H:%M:%S"
-        duration = (datetime.strptime(now_str(), fmt) - datetime.strptime(entry_time, fmt)).total_seconds()
+        exit_time_str = now_str()
+        duration = (datetime.strptime(exit_time_str, fmt) - datetime.strptime(entry_time, fmt)).total_seconds()
 
         c.execute("""
         UPDATE access_sessions
         SET exit_time = ?, duration_seconds = ?, status = 'closed'
         WHERE id = ?
-        """, (now_str(), duration, session_id))
+        """, (exit_time_str, duration, session_id))
 
     conn.commit()
     conn.close()
@@ -897,18 +1184,65 @@ def add_visible_session(
 def create_demo_seed():
     conn = get_conn()
     c = conn.cursor()
+    now = now_str()
+
+    c.execute("""
+    INSERT OR IGNORE INTO work_schedules (
+        schedule_id, schedule_name, allowed_days, start_time, end_time, is_active, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, 1, ?)
+    """, (
+        "sched_office",
+        "Office Schedule",
+        "Mon,Tue,Wed,Thu,Fri",
+        "08:00",
+        "18:00",
+        now,
+    ))
 
     c.execute("SELECT COUNT(*) AS cnt FROM employees")
-    count = c.fetchone()["cnt"]
+    employee_count = c.fetchone()["cnt"]
 
-    if count == 0:
-        ensure_identity("emp_001", "employee", "Employee 001", "active", 1)
+    if employee_count == 0:
+        c.execute("""
+        INSERT OR IGNORE INTO identities (
+            person_id, person_type, display_name, status, created_at, last_seen,
+            is_active, merged_into_person_id, resolved_at, resolution_note,
+            predicted_gender, predicted_age_range, attributes_locked, attributes_updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, NULL)
+        """, (
+            "emp_001",
+            "employee",
+            "Employee 001",
+            "active",
+            now,
+            now,
+            1,
+        ))
 
         c.execute("""
-        INSERT OR IGNORE INTO employees (person_id, employee_code, department, role_name, schedule_id)
+        INSERT OR IGNORE INTO employees (
+            person_id, employee_code, department, role_name, schedule_id
+        )
         VALUES ('emp_001', 'E001', 'IT', 'engineer', 'sched_office')
         """)
 
+    c.execute("""
+    SELECT 1
+    FROM access_policies
+    WHERE subject_type = 'role'
+      AND subject_value = 'engineer'
+      AND zone_id = ?
+      AND allowed_days = 'Mon,Tue,Wed,Thu,Fri,Sat,Sun'
+      AND allowed_start = '00:00'
+      AND allowed_end = '23:59'
+      AND is_active = 1
+    LIMIT 1
+    """, (DEFAULT_ZONE_ID,))
+    existing_policy = c.fetchone()
+
+    if existing_policy is None:
         c.execute("""
         INSERT INTO access_policies (
             subject_type, subject_value, zone_id, allowed_days, allowed_start, allowed_end, is_active
@@ -1187,9 +1521,22 @@ def get_grouped_daily_report(date_str: str):
         ensure_bucket(item["person_type"], item["person_id"])
         grouped[item["person_type"]][item["person_id"]]["total_visible_hours"] = item["total_visible_hours"]
 
+    def sort_bucket(bucket: dict):
+        return sorted(
+            bucket.values(),
+            key=lambda x: (x.get("total_visible_seconds", 0.0), x["person_id"]),
+            reverse=True,
+        )
+
     return {
         "date": date_str,
-        "employee": list(grouped["employee"].values()),
-        "visitor": list(grouped["visitor"].values()),
-        "unknown": list(grouped["unknown"].values()),
+        "employee": sort_bucket(grouped["employee"]),
+        "visitor": sort_bucket(grouped["visitor"]),
+        "unknown": sort_bucket(grouped["unknown"]),
     }
+
+
+if __name__ == "__main__":
+    init_db()
+    create_demo_seed()
+    print("database initialized")

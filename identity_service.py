@@ -47,6 +47,39 @@ class IdentityService:
     # Internal helpers
     # =========================================================
 
+    def _ensure_track_identity_fields(self, track):
+        track.setdefault("identity", None)
+        track.setdefault("identity_type", None)
+        track.setdefault("identity_score", None)
+
+        track.setdefault("identity_locked", False)
+        track.setdefault("identity_lock_score", None)
+
+        track.setdefault("stable_unknown_frames", 0)
+
+        track.setdefault("candidate_identity", None)
+        track.setdefault("candidate_identity_type", None)
+        track.setdefault("candidate_identity_score", None)
+        track.setdefault("candidate_identity_hits", 0)
+
+        track.setdefault("unknown_reuse_candidate_id", None)
+        track.setdefault("unknown_reuse_candidate_score", None)
+        track.setdefault("unknown_reuse_candidate_hits", 0)
+        track.setdefault("unknown_no_reuse_frames", 0)
+
+        # Means this track has already been resolved once into a concrete unknown identity,
+        # whether by reuse or by new creation. Prevents repeated unknown creation/reuse
+        # for the same persistent track.
+        track.setdefault("unknown_resolved_once", False)
+
+        track.setdefault("unknown_extra_embeddings_saved", 0)
+        track.setdefault("unknown_last_embedding_save_ts", 0.0)
+        track.setdefault("unknown_last_saved_embedding", None)
+
+        track.setdefault("pending_alert_sent", False)
+
+        self._clear_runtime_flags(track)
+
     def _reset_candidate(self, track):
         track["candidate_identity"] = None
         track["candidate_identity_type"] = None
@@ -124,7 +157,7 @@ class IdentityService:
         if candidate_hits < self.min_candidate_hits_to_confirm + 1:
             return False
 
-        # only switch if contradiction is consistently stronger
+        # Only switch if contradiction is consistently stronger
         if new_score >= self.min_lock_score and (new_score - current_score) >= self.stronger_score_diff:
             return True
 
@@ -193,6 +226,7 @@ class IdentityService:
     # =========================================================
 
     def process_track_identity(self, track, embedding):
+        self._ensure_track_identity_fields(track)
         self._clear_runtime_flags(track)
 
         match = self.recognizer.recognize(embedding)
@@ -219,7 +253,7 @@ class IdentityService:
 
                     return track
 
-                # build contradiction candidate
+                # Build contradiction candidate
                 if self._same_candidate(track, match):
                     track["candidate_identity_hits"] = track.get("candidate_identity_hits", 0) + 1
                     track["candidate_identity_score"] = matched_score
@@ -323,16 +357,18 @@ class IdentityService:
         track["unknown_no_reuse_frames"] = 0
 
     def convert_unknown_candidate_if_stable(self, track, embedding):
-        # if already resolved to a proper identity, do nothing
+        self._ensure_track_identity_fields(track)
+
+        # If already resolved to a proper identity, do nothing
         if track.get("identity") is not None and track.get("identity_type") != "unknown_candidate":
             return None
 
-        # do not create/reuse unknown too early
+        # Do not create/reuse unknown too early
         if track.get("stable_unknown_frames", 0) < UNKNOWN_STABLE_FRAMES_REQUIRED:
             return None
 
-        # avoid duplicate creation for same track
-        if track.get("unknown_created", False):
+        # Avoid duplicate resolution for same track
+        if track.get("unknown_resolved_once", False):
             return track.get("identity")
 
         reused = self._try_reuse_existing_unknown(embedding)
@@ -349,7 +385,7 @@ class IdentityService:
             self._set_confirmed_identity(track, reuse_candidate_id, "unknown", reuse_candidate_score)
             track["unknown_just_reused"] = True
 
-            track["unknown_created"] = True
+            track["unknown_resolved_once"] = True
             track["unknown_extra_embeddings_saved"] = 0
             track["unknown_last_embedding_save_ts"] = time.time()
             track["unknown_last_saved_embedding"] = np.asarray(embedding, dtype=np.float32).copy()
@@ -366,10 +402,11 @@ class IdentityService:
         person_id = create_unknown_identity()
         emb_json = json.dumps(np.asarray(embedding, dtype=float).tolist())
 
-        # Save only ONE real initial embedding.
-        # Extra varied embeddings will be added later while the same track persists.
+        # Save one initial embedding.
+        # Additional varied embeddings may be added later while the same track persists.
         add_embedding(person_id, emb_json, 1.0)
 
+        # Identity-layer alert: new unknown entity created in the database.
         add_alert(
             camera_id=self.camera_id,
             track_id=track["track_id"],
@@ -383,9 +420,10 @@ class IdentityService:
 
         self.recognizer.reload_embeddings()
 
-        self._set_confirmed_identity(track, person_id, "unknown", 0.0)
+        # Synthetic self-confirmation score for newly created unknown identity
+        self._set_confirmed_identity(track, person_id, "unknown", 1.0)
         track["pending_alert_sent"] = True
-        track["unknown_created"] = True
+        track["unknown_resolved_once"] = True
         track["unknown_just_created"] = True
 
         track["unknown_extra_embeddings_saved"] = 0
