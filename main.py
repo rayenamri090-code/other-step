@@ -28,6 +28,7 @@ from database import (
     get_grouped_daily_report,
     get_identity_attributes,
     save_identity_attributes,
+    get_identity_info,
 )
 from camera_source import CameraSource
 from detector import FaceDetector
@@ -224,6 +225,44 @@ def reset_alert_state_if_needed(track: dict, decision: str, person_id: str | Non
     if track.get("alert_person_id") is not None and track.get("alert_person_id") != person_id:
         track["alert_person_id"] = None
 
+
+# =========================================================
+# Person Snapshot Helpers
+# =========================================================
+
+def get_person_snapshot(track: dict, person_id: str | None):
+    info = None
+    if person_id:
+        try:
+            info = get_identity_info(person_id)
+        except Exception:
+            info = None
+
+    predicted_gender = track.get("stable_gender") or track.get("gender_prediction")
+    predicted_age_range = track.get("stable_age") or track.get("age_prediction")
+    attributes_locked = int(track.get("attributes_locked", False))
+
+    if info:
+        if not predicted_gender:
+            predicted_gender = info.get("predicted_gender")
+        if not predicted_age_range:
+            predicted_age_range = info.get("predicted_age_range")
+        if not attributes_locked:
+            attributes_locked = int(info.get("attributes_locked", 0) or 0)
+
+    return {
+        "display_name": info.get("display_name") if info else None,
+        "person_status": info.get("status") if info else None,
+        "predicted_gender": predicted_gender,
+        "predicted_age_range": predicted_age_range,
+        "attributes_locked": attributes_locked,
+        "stable_gender": track.get("stable_gender"),
+        "stable_age": track.get("stable_age"),
+        "identity_score": track.get("identity_score"),
+        "access_granted_count": track.get("access_granted_count", 0),
+        "access_denied_count": track.get("access_denied_count", 0),
+        "access_alert_count": track.get("access_alert_count", 0),
+    }
 
 # =========================================================
 # Drawing Helpers
@@ -586,11 +625,13 @@ def log_system_event(
     event_type: str,
     camera_id: str,
     zone_id: str | None,
+    zone_name: str | None,
     track_id: str | None = None,
     person_id: str | None = None,
     person_type: str | None = None,
     confidence: float | None = None,
     payload: dict | None = None,
+    extra_fields: dict | None = None,
 ):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -605,19 +646,25 @@ def log_system_event(
         payload=payload or {},
     )
 
+    event_payload = {
+        "timestamp": timestamp,
+        "event_type": event_type,
+        "camera_id": camera_id,
+        "zone_id": zone_id,
+        "zone_name": zone_name,
+        "track_id": track_id,
+        "person_id": person_id,
+        "person_type": person_type,
+        "confidence": confidence,
+        "payload": payload or {},
+    }
+
+    if extra_fields:
+        event_payload.update(extra_fields)
+
     publish_event(
         mqtt_service,
-        {
-            "timestamp": timestamp,
-            "event_type": event_type,
-            "camera_id": camera_id,
-            "zone_id": zone_id,
-            "track_id": track_id,
-            "person_id": person_id,
-            "person_type": person_type,
-            "confidence": confidence,
-            "payload": payload or {},
-        },
+        event_payload,
         kind="system",
     )
 
@@ -672,11 +719,13 @@ def main():
                 session_service.on_track_removed(removed)
 
                 if removed.get("identity"):
+                    snapshot = get_person_snapshot(removed, removed.get("identity"))
                     log_system_event(
                         mqtt_service=mqtt_service,
                         event_type="track_removed",
                         camera_id=CAMERA_ID,
                         zone_id=zone_id,
+                        zone_name=zone_name,
                         track_id=removed.get("track_id"),
                         person_id=removed.get("identity"),
                         person_type=removed.get("identity_type"),
@@ -686,6 +735,7 @@ def main():
                             "seen_frames": removed.get("seen_frames"),
                             "missing_frames": removed.get("missing_frames"),
                         },
+                        extra_fields=snapshot,
                     )
 
             current_time = time.time()
@@ -737,6 +787,8 @@ def main():
                     created_or_reused = identity_service.convert_unknown_candidate_if_stable(track, embedding)
 
                     if created_or_reused:
+                        snapshot = get_person_snapshot(track, created_or_reused)
+
                         if track.get("unknown_just_created"):
                             add_access_event(
                                 camera_id=CAMERA_ID,
@@ -755,11 +807,13 @@ def main():
                                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                     "camera_id": CAMERA_ID,
                                     "zone_id": zone_id,
+                                    "zone_name": zone_name,
                                     "track_id": track_id,
                                     "person_id": created_or_reused,
                                     "person_type": "unknown",
                                     "action": "UNKNOWN_AUTO_CREATED",
                                     "extra": "pending_validation",
+                                    **snapshot,
                                 },
                                 kind="access",
                             )
@@ -769,6 +823,7 @@ def main():
                                 event_type="unknown_created",
                                 camera_id=CAMERA_ID,
                                 zone_id=zone_id,
+                                zone_name=zone_name,
                                 track_id=track_id,
                                 person_id=created_or_reused,
                                 person_type="unknown",
@@ -777,6 +832,7 @@ def main():
                                     "status": "pending_validation",
                                     "source": "auto_creation",
                                 },
+                                extra_fields=snapshot,
                             )
 
                         elif track.get("unknown_just_reused"):
@@ -785,6 +841,7 @@ def main():
                                 event_type="unknown_reused",
                                 camera_id=CAMERA_ID,
                                 zone_id=zone_id,
+                                zone_name=zone_name,
                                 track_id=track_id,
                                 person_id=created_or_reused,
                                 person_type="unknown",
@@ -792,16 +849,21 @@ def main():
                                 payload={
                                     "source": "unknown_reidentification",
                                 },
+                                extra_fields=snapshot,
                             )
 
                 if track.get("identity_just_confirmed"):
+                    person_id_for_event = track.get("identity")
+                    snapshot = get_person_snapshot(track, person_id_for_event)
+
                     log_system_event(
                         mqtt_service=mqtt_service,
                         event_type="person_recognized",
                         camera_id=CAMERA_ID,
                         zone_id=zone_id,
+                        zone_name=zone_name,
                         track_id=track_id,
-                        person_id=track.get("identity"),
+                        person_id=person_id_for_event,
                         person_type=track.get("identity_type"),
                         confidence=track.get("identity_score"),
                         payload={
@@ -809,21 +871,16 @@ def main():
                             "previous_identity_type": previous_identity_type,
                             "identity_switched": track.get("identity_just_switched", False),
                         },
+                        extra_fields=snapshot,
                     )
 
                 person_id = track.get("identity")
                 person_type = track.get("identity_type")
 
-                # ---------------------------------------------
-                # Load locked attributes once from DB
-                # ---------------------------------------------
                 if person_id and person_type in ("employee", "visitor", "unknown"):
                     if not track.get("attributes_loaded_from_db", False):
                         load_locked_attributes_into_track(track, person_id)
 
-                # ---------------------------------------------
-                # Predict attributes only when NOT locked
-                # ---------------------------------------------
                 if (
                     person_id
                     and person_type in ("employee", "visitor", "unknown")
@@ -877,11 +934,14 @@ def main():
                             or raw_age_changed
                         )
                     ):
+                        snapshot = get_person_snapshot(track, person_id)
+
                         log_system_event(
                             mqtt_service=mqtt_service,
                             event_type="attribute_updated",
                             camera_id=CAMERA_ID,
                             zone_id=zone_id,
+                            zone_name=zone_name,
                             track_id=track_id,
                             person_id=person_id,
                             person_type=person_type,
@@ -896,15 +956,18 @@ def main():
                                 "stable_age": track.get("stable_age"),
                                 "age_history": track.get("age_history", []),
                             },
+                            extra_fields=snapshot,
                         )
 
-                    # Lock permanently once both values are stable
                     if try_lock_attributes_for_identity(track, person_id):
+                        snapshot = get_person_snapshot(track, person_id)
+
                         log_system_event(
                             mqtt_service=mqtt_service,
                             event_type="attributes_locked",
                             camera_id=CAMERA_ID,
                             zone_id=zone_id,
+                            zone_name=zone_name,
                             track_id=track_id,
                             person_id=person_id,
                             person_type=person_type,
@@ -913,6 +976,7 @@ def main():
                                 "predicted_gender": track.get("stable_gender"),
                                 "predicted_age_range": track.get("stable_age"),
                             },
+                            extra_fields=snapshot,
                         )
 
                 decision, reason = authorization_service.decide(
@@ -929,6 +993,8 @@ def main():
                     session_service.on_track_seen(track, person_id)
 
                 if person_id:
+                    snapshot = get_person_snapshot(track, person_id)
+
                     if should_log_access_decision(track, decision, reason, now_ts):
                         session_service.record_access_decision(track, decision)
 
@@ -949,12 +1015,14 @@ def main():
                                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 "camera_id": CAMERA_ID,
                                 "zone_id": zone_id,
+                                "zone_name": zone_name,
                                 "track_id": track_id,
                                 "person_id": person_id,
                                 "person_type": person_type,
                                 "action": decision,
                                 "confidence": track.get("identity_score"),
                                 "extra": reason,
+                                **snapshot,
                             },
                             kind="access",
                         )
@@ -964,6 +1032,7 @@ def main():
                             event_type="access_decision",
                             camera_id=CAMERA_ID,
                             zone_id=zone_id,
+                            zone_name=zone_name,
                             track_id=track_id,
                             person_id=person_id,
                             person_type=person_type,
@@ -972,6 +1041,7 @@ def main():
                                 "decision": decision,
                                 "reason": reason,
                             },
+                            extra_fields=snapshot,
                         )
 
                         track["last_logged_ts"] = now_ts
@@ -979,6 +1049,8 @@ def main():
                         track["last_logged_reason"] = reason
 
                 if decision == "ALERT_PENDING" and person_id:
+                    snapshot = get_person_snapshot(track, person_id)
+
                     if should_create_alert(track, person_id, now_ts):
                         add_alert(
                             camera_id=CAMERA_ID,
@@ -992,26 +1064,29 @@ def main():
                         )
 
                         publish_event(
-                            mqtt_service,
-                            {
-                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "camera_id": CAMERA_ID,
-                                "zone_id": zone_id,
-                                "track_id": track_id,
-                                "person_id": person_id,
-                                "person_type": person_type,
-                                "alert_type": "UNKNOWN_PENDING_VALIDATION",
-                                "reason": reason,
-                                "status": "open",
-                            },
-                            kind="alert",
-                        )
+mqtt_service,
+    {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "camera_id": CAMERA_ID,
+        "zone_id": zone_id,
+        "zone_name": zone_name,
+        "track_id": track_id,
+        "person_id": person_id,
+        "person_type": person_type,
+        "alert_type": "UNKNOWN_PENDING_VALIDATION",
+        "reason": reason,
+        "alert_status": "open",
+        **snapshot,
+    },
+    kind="alert",
+)
 
                         log_system_event(
                             mqtt_service=mqtt_service,
                             event_type="alert_created",
                             camera_id=CAMERA_ID,
                             zone_id=zone_id,
+                            zone_name=zone_name,
                             track_id=track_id,
                             person_id=person_id,
                             person_type=person_type,
@@ -1020,6 +1095,7 @@ def main():
                                 "alert_type": "UNKNOWN_PENDING_VALIDATION",
                                 "reason": reason,
                             },
+                            extra_fields=snapshot,
                         )
 
                         track["last_alert_ts"] = now_ts
